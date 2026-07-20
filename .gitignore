@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Generated artefacts
+report.json
+report.md
+calibration.json
+calibration_example.json
+calibration_example.md
+demo.json
+demo.md
+probe.json
+
+# Source research documents (large binaries, not part of the package)
+*.docx
+
+.DS_Store
+.idea/
+.vscode/

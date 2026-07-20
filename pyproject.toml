@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "semantic-entropy-gate"
+version = "0.1.0"
+description = "Detect LLM confabulation with semantic entropy (Farquhar et al., Nature 2024) and gate agent actions on it."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "semantic-entropy-gate contributors" }]
+keywords = [
+    "llm",
+    "hallucination",
+    "confabulation",
+    "semantic-entropy",
+    "uncertainty-quantification",
+    "nli",
+    "entailment",
+    "agents",
+    "guardrails",
+    "active-inference",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# Zero runtime dependencies: the core library is pure Python standard library.
+# Transformers / torch are only needed for the optional cross-encoder backend.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/krishddd/semantic-entropy-gate"
+Repository = "https://github.com/krishddd/semantic-entropy-gate"
+Issues = "https://github.com/krishddd/semantic-entropy-gate/issues"
+
+[project.optional-dependencies]
+hf = ["transformers>=4.30", "torch>=2.0"]
+openai = ["openai>=1.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4", "build>=1.0"]
+
+[project.scripts]
+sem-gate = "semantic_entropy_gate.cli:main"
+semantic-entropy-gate = "semantic_entropy_gate.cli:main"
+
+[project.entry-points.pytest11]
+semantic_entropy_gate = "semantic_entropy_gate.pytest_plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/semantic_entropy_gate"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/semantic_entropy_gate", "README.md", "LICENSE", "examples", "tests", "docs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "W"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# The report module embeds markdown templates; hard-wrapping them hurts readability.
+"src/semantic_entropy_gate/report.py" = ["E501"]
+# Tests and examples favour readable, self-documenting lines over a hard cap.
+"tests/**" = ["E501"]
+"examples/**" = ["E501"]
+
+[tool.coverage.run]
+source = ["semantic_entropy_gate"]
+branch = true
