@@ -30,7 +30,7 @@ models using semantic entropy*, Nature 630 (2024).
 
 from __future__ import annotations
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from .active_inference import (
     Policy,
@@ -113,6 +113,14 @@ from .types import (
     SemanticCluster,
     ThresholdPoint,
 )
+from .validation import (
+    DriftReport,
+    LabelAudit,
+    LabelSuspect,
+    audit_labels,
+    detect_drift,
+    ks_2sample,
+)
 
 __all__ = [
     "__version__",
@@ -149,6 +157,13 @@ __all__ = [
     "preflight",
     "PreflightReport",
     "Check",
+    # label quality + traffic drift
+    "audit_labels",
+    "LabelAudit",
+    "LabelSuspect",
+    "detect_drift",
+    "DriftReport",
+    "ks_2sample",
     # samplers
     "resolve_sampler",
     "from_texts",

@@ -120,6 +120,7 @@ class Report:
                 curve=[ThresholdPoint(**p) for p in raw_cal.get("curve", [])],
                 base_rate=raw_cal.get("base_rate", 0.0),
                 caveats=list(raw_cal.get("caveats", [])),
+                dev_scores=list(raw_cal.get("dev_scores", [])),
                 metadata=raw_cal.get("metadata", {}),
             )
         return cls(

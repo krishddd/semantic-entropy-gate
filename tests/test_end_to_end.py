@@ -155,7 +155,7 @@ def test_public_api_surface_is_importable():
 def test_version_is_exposed():
     import semantic_entropy_gate as package
 
-    assert package.__version__ == "0.5.0"
+    assert package.__version__ == "0.6.0"
 
 
 def test_scoring_is_deterministic_for_fixed_samples(confabulating_samples):

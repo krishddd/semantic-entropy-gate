@@ -133,7 +133,7 @@ def build_gate(threshold: float, *, calibrated: bool) -> Gate:
 # ===========================================================================
 
 
-def calibrate_threshold() -> float:
+def calibrate_threshold():
     """In production this runs offline over a labelled dev set, once."""
     backend = LLMJudgeEntailment(entailment_judge)
     results, labels = [], []
@@ -156,7 +156,7 @@ def calibrate_threshold() -> float:
             "threshold as provisional and re-fit on more labelled prompts.",
             file=sys.stderr,
         )
-    return calibration.threshold
+    return calibration
 
 
 # ===========================================================================
@@ -192,8 +192,8 @@ def handle(gate: Gate, prompt: str, order_id: int, audit) -> None:
 
 
 def main() -> None:
-    threshold = calibrate_threshold()
-    gate = build_gate(threshold, calibrated=True)
+    calibration = calibrate_threshold()
+    gate = build_gate(calibration.threshold, calibrated=True)
 
     audit = []
     print("=" * 78)
@@ -216,6 +216,21 @@ def main() -> None:
 
     executed = [row for row in audit if row["executed"]]
     assert len(executed) == 1, "only the confidently-answered order should refund"
+
+    # =======================================================================
+    # 5. MONITOR. The one assumption doctor could not verify at deploy time -
+    #    that the dev set represents live traffic - is measurable now that the
+    #    gate has history. Run this periodically (a cron, a metrics hook).
+    # =======================================================================
+    print()
+    print("=" * 78)
+    print("DRIFT CHECK (run periodically once history accumulates)")
+    print("=" * 78)
+    try:
+        drift = gate.check_drift(calibration)
+        print(drift.explain())
+    except Exception as exc:  # noqa: BLE001 - not enough history yet is normal
+        print(f"not enough live history yet ({exc}) - keep serving and re-check")
 
 
 # ===========================================================================

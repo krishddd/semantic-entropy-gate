@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-21
+
+The 0.5.0 verdict rested on two assumptions doctor could not check: that your
+labels are right, and that your dev prompts resemble live traffic. Neither can
+be verified against truth - ground truth is yours, and a library that claimed
+otherwise would be lying. But both have a checkable shadow, and both are now
+checked.
+
+### Added
+
+- **`audit_labels()` + doctor's "label consistency" check.** Two layers:
+  - *Exact conflicts*: the same prompt labelled both ways. Not statistical -
+    at least one label IS wrong, and the AUROC was fitted to it - so doctor
+    FAILs and names the rows.
+  - *Statistical suspects*: rows where the label contradicts the entropy signal
+    (labelled correct amid scattered generations; labelled hallucinated amid a
+    unanimous answer), ranked by misfit - the confident-learning intuition that
+    mislabels concentrate exactly there. Reported as **review candidates**,
+    never verdicts: hard rows land in the ranking too, the wording admits the
+    consistent-but-wrong alternative entropy cannot see, and doctor only WARNs
+    when more than 10% of the dev set is suspect - a checker that cries wolf on
+    every difficult example trains people to ignore it.
+- **`Gate.check_drift()` + `detect_drift()`.** Representativeness is unknowable
+  at deploy time and measurable afterwards: every calibration now stores its
+  dev-score distribution (`CalibrationResult.dev_scores`, in the JSON report,
+  so drift is checkable months later from the artefact), the gate keeps its
+  history, and a two-sample KS test compares them. Conservative by design:
+  alpha=0.01, refuses any verdict on fewer than 20 live decisions ("a KS test
+  on 5 points is a coin flip wearing a formula"), excludes failed/unreliable
+  measurements from the evidence, and the DRIFT DETECTED message says the
+  threshold is *not automatically wrong* - the evidence behind it no longer
+  applies - with the concrete remedy (label recent prompts, re-run doctor,
+  redeploy).
+- **`ks_2sample()`** - stdlib, exact-reproducible, and **tie-aware**: entropy
+  scores tie constantly (every confident prompt is exactly 0.0), and the naive
+  two-pointer reads two identical samples as maximally different. Also inherits
+  Numerical Recipes' answer to the diverging Kolmogorov series at lambda~0:
+  non-convergence means p=1.0, not the spurious p=0.0 a truncated sum returns.
+
+### Changed
+
+- `examples/production_agent.py` gains step 5, MONITOR: a periodic
+  `gate.check_drift(calibration)` - which correctly refuses a verdict until
+  enough history accumulates.
+- Drift direction is diagnosed, not just detected: live entropy running HIGH
+  means more deferrals than calibration predicted; running LOW means easier
+  traffic *or a degraded sampler quietly suppressing disagreement* - check
+  doctor.
+
 ## [0.5.0] - 2026-07-21
 
 Closes the gap named at the end of 0.4.0: *"`sem-gate doctor` still can't check
@@ -277,6 +326,7 @@ First public release. Implements semantic entropy for hallucination detection
 - Zero runtime dependencies; MIT licensed; CI across Python 3.9–3.12 with lint,
   tests, an offline CLI smoke test and a clean-env wheel install check.
 
+[0.6.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.6.0
 [0.5.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.5.0
 [0.4.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.4.0
 [0.3.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.3.0

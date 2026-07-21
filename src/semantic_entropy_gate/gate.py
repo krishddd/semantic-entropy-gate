@@ -474,6 +474,30 @@ class Gate:
         if len(self.history) > self.max_history:
             del self.history[: len(self.history) - self.max_history]
 
+    def check_drift(self, calibration: Any, *, alpha: float = 0.01, min_live: int = 20):
+        """Does live traffic still look like the dev set this gate was calibrated on?
+
+        The one assumption `sem-gate doctor` cannot verify at deploy time —
+        that the dev set represents live traffic — becomes measurable the moment
+        the gate has history: compare the entropy scores of real decisions
+        against the calibration's ``dev_scores`` with a two-sample KS test.
+
+        ``calibration`` is a :class:`~semantic_entropy_gate.types.CalibrationResult`
+        (or any object with ``dev_scores``), typically the one `doctor` returned
+        or `Report.load(...).calibration`. Raises
+        :class:`~semantic_entropy_gate.errors.CalibrationError` when there is
+        not enough live history to say anything defensible — a verdict from five
+        decisions would be noise wearing a formula.
+
+        Failed and unreliable measurements are excluded: they score a synthetic
+        1.0 that says nothing about the traffic distribution.
+        """
+        from .validation import detect_drift
+
+        dev_scores = getattr(calibration, "dev_scores", None) or calibration
+        live = [d.score for d in self.history if d.result.reliable and not d.metadata.get("failed")]
+        return detect_drift(live, list(dev_scores), alpha=alpha, min_live=min_live)
+
     def stats(self) -> Dict[str, Any]:
         """Aggregate counters over the gate's decision history."""
         counts: Dict[str, int] = {a.value: 0 for a in GateAction}

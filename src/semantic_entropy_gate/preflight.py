@@ -258,6 +258,8 @@ def _check_task_separation(
         report.add("task separation", FAIL, str(exc))
         return None
 
+    _check_label_quality(report, results, labels)
+
     detail = (
         f"AUROC {calibration.auroc:.3f} "
         f"[{calibration.auroc_lower:.3f}, {calibration.auroc_upper:.3f}] "
@@ -318,6 +320,51 @@ def _check_task_separation(
         else "Fitted on evidence that carries caveats - treat as provisional.",
     )
     return calibration
+
+
+def _check_label_quality(report: PreflightReport, results, labels) -> None:
+    """The labels themselves cannot be verified against truth - but their
+    checkable shadow can: exact conflicts (same prompt labelled both ways, at
+    least one label IS wrong) and statistical suspects (rows where the label
+    contradicts the entropy signal, which is where mislabels concentrate).
+
+    AUROC against wrong labels measures nothing, so this runs right next to the
+    separation verdict rather than in a tool nobody opens.
+    """
+    from .validation import audit_labels
+
+    audit = audit_labels(results, labels)
+    if audit.conflicts:
+        preview = "; ".join(
+            f"{prompt[:40]!r} rows {indices}" for prompt, indices in audit.conflicts[:3]
+        )
+        report.add(
+            "label consistency",
+            FAIL,
+            f"{len(audit.conflicts)} prompt(s) labelled both ways: {preview}",
+            "The same question cannot be both a correct answer and a hallucination, "
+            "so at least one of each pair is wrong - and the AUROC above was fitted "
+            "to it. Fix these rows and re-run.",
+        )
+        return
+    if audit.suspects and audit.suspect_rate > 0.1:
+        worst = audit.suspects[0]
+        report.add(
+            "label consistency",
+            WARN,
+            f"{len(audit.suspects)} label(s) contradict the entropy signal "
+            f"({audit.suspect_rate:.0%} of the dev set); worst: {worst.prompt[:40]!r}",
+            f"Not proof of mislabelling - hard rows land here too - but mislabels "
+            f"concentrate here. Worst row: {worst.why}. Re-review with "
+            "`sem-gate label --relabel` before trusting the AUROC above.",
+        )
+    else:
+        report.add(
+            "label consistency",
+            PASS,
+            "no conflicts"
+            + (f"; {len(audit.suspects)} suspect(s) worth a glance" if audit.suspects else ""),
+        )
 
 
 def _needed_for(calibration: Any) -> str:

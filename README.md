@@ -152,6 +152,39 @@ Without `--dev-set`, the report says so instead of implying otherwise:
           semantic entropy actually separates hallucinations on YOUR task.
 ```
 
+### The two assumptions behind the verdict — and their checkable shadows
+
+That AUROC rests on two things `doctor` cannot verify against truth: **your labels are right**, and **your dev prompts resemble live traffic**. Ground truth is yours; a library that claimed to verify it would be lying. But both assumptions have a checkable shadow, and both are checked:
+
+**Labels.** The same prompt labelled both ways is an *exact* inconsistency — at least one label is wrong, and the AUROC was fitted to it — so `doctor` FAILs on it. Beyond that, mislabels concentrate where the label contradicts the entropy signal: a row labelled *correct* whose generations scatter across five meanings, or labelled *hallucinated* while the model answers unanimously. `audit_labels()` ranks these as **review candidates** (never verdicts — hard rows land there too, and the wording says so), and `doctor` warns when more than 10% of the dev set is suspect:
+
+```
+[WARN] label consistency      6 label(s) contradict the entropy signal (15% of the dev set)
+       -> Not proof of mislabelling - hard rows land here too - but mislabels
+          concentrate here. Re-review with `sem-gate label --relabel` before
+          trusting the AUROC above.
+```
+
+**Traffic.** Whether the dev set resembles live traffic is unknowable at deploy time and *measurable afterwards*. Every calibration stores its dev-score distribution, the gate keeps its decision history, and one call compares them (two-sample KS, stdlib, tie-aware — entropy scores tie constantly):
+
+```python
+drift = gate.check_drift(calibration)   # periodically: cron, metrics hook
+if drift.drifted:
+    alert(drift.explain())
+```
+
+```
+DRIFT DETECTED (p < 0.01): the traffic this gate is judging no longer looks
+like the dev set its threshold was calibrated on. The threshold is not
+automatically wrong, but the evidence behind it no longer applies.
+Remedy: `sem-gate label` a sample of RECENT prompts, re-run
+`sem-gate doctor --dev-set`, and redeploy the refitted threshold.
+```
+
+Deliberately conservative: α=0.01 (a monitor that pages on noise gets unplugged), a refusal to render any verdict on fewer than 20 live decisions, and failed/unreliable measurements excluded from the evidence. A drop in live entropy is flagged too — easier traffic is one explanation, but so is a degraded sampler quietly suppressing disagreement.
+
+What remains genuinely yours: whether a label is *true*, and whether the re-labelled sample you respond to drift with is honest. Those are the irreducible inputs — everything downstream of them is now checked.
+
 ### Or just watch it work, offline
 
 ```bash

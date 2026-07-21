@@ -506,6 +506,12 @@ class CalibrationResult:
     curve: List[ThresholdPoint] = field(default_factory=list)
     base_rate: float = 0.0
     confidence: float = 0.95
+    dev_scores: List[float] = field(default_factory=list)
+    """The entropy scores this calibration was fitted on. Kept so runtime drift
+    detection (:meth:`~semantic_entropy_gate.gate.Gate.check_drift`) has its
+    reference distribution — without it, "does live traffic still look like the
+    dev set?" is unanswerable."""
+
     caveats: List[str] = field(default_factory=list)
     """Reasons this threshold is less trustworthy than its decimals suggest."""
 
@@ -543,6 +549,7 @@ class CalibrationResult:
             "n_negative": self.n_negative,
             "base_rate": self.base_rate,
             "caveats": list(self.caveats),
+            "dev_scores": [round(v, 6) for v in self.dev_scores],
             "trustworthy": self.trustworthy,
             "operating_point": self.operating_point.to_dict(),
             "curve": [p.to_dict() for p in self.curve],

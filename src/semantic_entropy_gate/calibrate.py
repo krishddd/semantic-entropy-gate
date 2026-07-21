@@ -179,6 +179,7 @@ def calibrate(
         operating_point=point,
         curve=curve,
         base_rate=n_pos / len(ys),
+        dev_scores=list(scores),
         caveats=caveats,
         metadata={
             "normalized": normalized,
