@@ -30,7 +30,7 @@ models using semantic entropy*, Nature 630 (2024).
 
 from __future__ import annotations
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 from .active_inference import (
     Policy,
@@ -118,7 +118,10 @@ from .validation import (
     LabelAudit,
     LabelSuspect,
     audit_labels,
+    cross_check_references,
+    derive_label,
     detect_drift,
+    find_stale_labels,
     ks_2sample,
 )
 
@@ -164,6 +167,9 @@ __all__ = [
     "detect_drift",
     "DriftReport",
     "ks_2sample",
+    "derive_label",
+    "cross_check_references",
+    "find_stale_labels",
     # samplers
     "resolve_sampler",
     "from_texts",

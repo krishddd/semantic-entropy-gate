@@ -183,7 +183,23 @@ Remedy: `sem-gate label` a sample of RECENT prompts, re-run
 
 Deliberately conservative: α=0.01 (a monitor that pages on noise gets unplugged), a refusal to render any verdict on fewer than 20 live decisions, and failed/unreliable measurements excluded from the evidence. A drop in live entropy is flagged too — easier traffic is one explanation, but so is a degraded sampler quietly suppressing disagreement.
 
-What remains genuinely yours: whether a label is *true*, and whether the re-labelled sample you respond to drift with is honest. Those are the irreducible inputs — everything downstream of them is now checked.
+### Shrinking what you have to take on faith
+
+Even those two residues turned out to be reducible:
+
+**A label can be derived instead of asserted.** Give a row a `reference` field — the known-correct answer — and the label stops being an opinion: the consensus either entails the reference (label 0), contradicts it (label 1), or the oracle *abstains* and a human is asked, because deriving an uncertain verdict and recording it as ground truth would launder the oracle's ignorance into a fact.
+
+```bash
+sem-gate label --input prompts.jsonl --out dev.jsonl --auto   # derives where it can
+```
+
+Derived labels are **re-derivable by anyone** from the same strings and oracle, the derivation reasoning is stored on the row, and `doctor` cross-checks asserted labels against reference-implied ones — flagging disagreements while naming all three possible culprits (label, reference, or oracle).
+
+**A label knows which answer it judged.** Every label records `labeled_answer` — the consensus it was a verdict on. A label is a claim about an *answer*, not a prompt; when the model stops giving that answer, `doctor` flags the label as stale rather than silently scoring the present model against a judgement about a past one.
+
+**The re-label sample is protocol, not trust.** `gate.relabel_sample(k, seed=...)` draws the drift-response sample uniformly from the gate's own history — seeded, reproducible, broken measurements excluded, provenance attached from birth. There is no step where a human picks flattering prompts.
+
+What is left, precisely: **the truth of your reference answers** (one auditable artifact per prompt, instead of a per-row judgement call), and the human verdicts on rows where the oracle abstained. Everything downstream — derivation, consistency, staleness, separation, calibration, drift, and the sampling protocol itself — is checked, recorded, and re-runnable by anyone.
 
 ### Or just watch it work, offline
 

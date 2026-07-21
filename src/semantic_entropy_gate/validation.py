@@ -44,6 +44,9 @@ __all__ = [
     "LabelSuspect",
     "LabelAudit",
     "audit_labels",
+    "derive_label",
+    "cross_check_references",
+    "find_stale_labels",
     "ks_2sample",
     "DriftReport",
     "detect_drift",
@@ -197,6 +200,118 @@ def audit_labels(
     candidates.sort(key=lambda s: -s.misfit)
     audit.suspects = candidates[:max_suspects]
     return audit
+
+
+# ===================================================== references & staleness
+
+
+def derive_label(
+    consensus: str,
+    reference: str,
+    entailment: Any,
+    *,
+    context: str = "",
+) -> Tuple[Optional[int], str]:
+    """Derive a label from a reference answer instead of asserting one.
+
+    A label is an opinion; a reference is an artifact. When the known-correct
+    answer exists, "did the model hallucinate?" stops being a judgement call:
+    the consensus answer either means the same thing as the reference
+    (bidirectional entailment -> label 0) or contradicts it (-> label 1).
+    Anyone can re-derive the label from the same two strings and the same
+    oracle — which is what makes it auditable.
+
+    Returns ``(label, why)``; ``label`` is ``None`` when the oracle cannot tell
+    (neutral both ways), because *deriving* an uncertain verdict and recording
+    it as ground truth would launder the oracle's ignorance into a fact. The
+    caller asks a human for exactly those rows.
+    """
+    if not consensus or not consensus.strip():
+        return 1, "the model produced no consensus answer to compare"
+    equivalent, forward, backward = entailment.bidirectional(
+        consensus, reference, context=context, strict=True
+    )
+    if equivalent:
+        return 0, f"consensus {consensus[:40]!r} is equivalent to the reference"
+    from .types import EntailmentLabel
+
+    fl, bl = forward[0], backward[0]
+    if EntailmentLabel.CONTRADICTION in (fl, bl):
+        return 1, f"consensus {consensus[:40]!r} contradicts the reference"
+    return None, (
+        f"the entailment backend cannot relate consensus {consensus[:40]!r} to the "
+        "reference (neutral both ways); a human must judge this row"
+    )
+
+
+def cross_check_references(
+    results: Sequence[EntropyResult],
+    labels: Sequence[Union[int, bool]],
+    references: Sequence[Optional[str]],
+    entailment: Any,
+) -> List[Dict[str, Any]]:
+    """Rows where the asserted label disagrees with the reference-implied one.
+
+    When both exist they must agree — otherwise either the label is wrong or
+    the entailment oracle misread the pair, and either way a human should look
+    *before* the AUROC fitted to that label is trusted. Each mismatch carries
+    the derivation's reasoning so the reviewer sees why, not just that.
+    """
+    mismatches: List[Dict[str, Any]] = []
+    for i, (result, label, reference) in enumerate(zip(results, labels, references)):
+        if reference is None or not isinstance(result, EntropyResult):
+            continue
+        derived, why = derive_label(
+            result.consensus_answer or "", reference, entailment, context=result.prompt
+        )
+        if derived is None:
+            continue  # the oracle abstained; nothing to contradict
+        if derived != int(bool(label)):
+            mismatches.append(
+                {
+                    "index": i,
+                    "prompt": result.prompt,
+                    "label": int(bool(label)),
+                    "derived": derived,
+                    "reference": reference,
+                    "consensus": result.consensus_answer,
+                    "why": why,
+                }
+            )
+    return mismatches
+
+
+def find_stale_labels(
+    results: Sequence[EntropyResult],
+    labeled_answers: Sequence[Optional[str]],
+    entailment: Any,
+) -> List[Dict[str, Any]]:
+    """Labels judged against an answer the model no longer gives.
+
+    A label is a claim about a specific answer, not about a prompt. If the
+    consensus at label time was "30 days" and the model now says "60 days",
+    the recorded label — right or wrong at the time — describes an answer that
+    no longer exists, and keeping it in the dev set scores the present model
+    against a judgement about the past one.
+    """
+    stale: List[Dict[str, Any]] = []
+    for i, (result, then) in enumerate(zip(results, labeled_answers)):
+        if not then or not isinstance(result, EntropyResult):
+            continue
+        now = result.consensus_answer or ""
+        if now.strip() == then.strip():
+            continue
+        equivalent, _f, _b = entailment.bidirectional(now, then, context=result.prompt, strict=True)
+        if not equivalent:
+            stale.append(
+                {
+                    "index": i,
+                    "prompt": result.prompt,
+                    "labeled_answer": then,
+                    "current_consensus": now,
+                }
+            )
+    return stale
 
 
 # ================================================================== drift

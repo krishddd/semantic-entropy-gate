@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-21
+
+The 0.6.0 note called two things irreducible: whether a label is true, and
+whether the drift-response re-label sample is honest. Both shrank.
+
+### Added
+
+- **Derivable labels.** Rows may carry a `reference` field - the known-correct
+  answer - and the label stops being an opinion: `derive_label()` compares the
+  model's consensus against the reference by bidirectional entailment
+  (equivalent -> 0, contradicts -> 1). When the oracle cannot tell, it
+  **abstains and a human is asked** - deriving an uncertain verdict and
+  recording it as ground truth would launder the oracle's ignorance into a
+  fact, and the test suite pins that it never happens. `sem-gate label --auto`
+  derives where it can, asks where it cannot, and stores the derivation
+  reasoning on the row (`label_derivation`) so it is auditable and
+  re-derivable by anyone holding the same strings and oracle.
+- **Label provenance and exact staleness.** Every label now records
+  `labeled_answer` - the consensus it judged. A label is a claim about an
+  answer, not a prompt; `find_stale_labels()` and doctor's "label staleness"
+  check flag labels whose answer the model no longer gives, instead of
+  silently scoring the present model against a judgement about a past one.
+- **Reference cross-checks in doctor.** "labels vs references" WARNs when an
+  asserted label disagrees with the reference-implied one, naming all three
+  possible culprits - label, reference, or oracle - because the check itself
+  leans on the entailment backend and claiming certainty it does not have is
+  the failure mode this library exists to prevent. (Pinned in tests: an
+  always-neutral oracle abstains wholesale - a PASS by silence, never a WARN
+  by guesswork.)
+- **`Gate.relabel_sample(k, seed)`** - the drift-response sample as protocol,
+  not trust: seeded, drawn uniformly from the gate's own history, reproducible
+  by anyone with the same history and seed, broken measurements excluded,
+  provenance attached from birth, and the rows round-trip directly into
+  `sem-gate label`.
+
+### The residue, stated precisely
+
+What remains is the truth of the reference answers (one auditable artifact per
+prompt instead of a per-row judgement call) and the human verdicts on rows
+where the oracle abstained. Everything downstream - derivation, consistency,
+staleness, separation, calibration, drift, and the sampling protocol - is
+checked, recorded, and re-runnable.
+
 ## [0.6.0] - 2026-07-21
 
 The 0.5.0 verdict rested on two assumptions doctor could not check: that your
@@ -326,6 +369,7 @@ First public release. Implements semantic entropy for hallucination detection
 - Zero runtime dependencies; MIT licensed; CI across Python 3.9–3.12 with lint,
   tests, an offline CLI smoke test and a clean-env wheel install check.
 
+[0.7.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.7.0
 [0.6.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.6.0
 [0.5.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.5.0
 [0.4.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.4.0

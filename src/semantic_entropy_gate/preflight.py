@@ -259,6 +259,7 @@ def _check_task_separation(
         return None
 
     _check_label_quality(report, results, labels)
+    _check_references_and_staleness(report, dev_set, results, labels, backend)
 
     detail = (
         f"AUROC {calibration.auroc:.3f} "
@@ -365,6 +366,75 @@ def _check_label_quality(report: PreflightReport, results, labels) -> None:
             "no conflicts"
             + (f"; {len(audit.suspects)} suspect(s) worth a glance" if audit.suspects else ""),
         )
+
+
+def _check_references_and_staleness(
+    report: PreflightReport, dev_set, results, labels, backend
+) -> None:
+    """When rows carry references or label provenance, use them.
+
+    References make the label *derivable*: the asserted label must agree with
+    what bidirectional entailment of consensus-vs-reference implies, or a human
+    needs to look before trusting the AUROC fitted to it. Provenance
+    (``labeled_answer``) makes staleness *exact*: a label is a claim about a
+    specific answer, and if the model no longer gives that answer, the label
+    describes a model that no longer exists.
+
+    Both checks WARN rather than FAIL: the cross-check leans on the entailment
+    oracle, which can misread a pair, and claiming certainty it does not have
+    is the failure mode this library exists to prevent.
+    """
+    from .validation import cross_check_references, find_stale_labels
+
+    labelled_rows = [row for row in dev_set if getattr(row, "label", None) is not None]
+    references = [getattr(row, "reference", None) for row in labelled_rows]
+    if any(reference is not None for reference in references):
+        mismatches = cross_check_references(results, labels, references, backend)
+        n_with_ref = sum(1 for r in references if r is not None)
+        if mismatches:
+            worst = mismatches[0]
+            report.add(
+                "labels vs references",
+                WARN,
+                f"{len(mismatches)} of {n_with_ref} referenced row(s) disagree with the "
+                f"label the reference implies; e.g. {worst['prompt'][:40]!r}: "
+                f"asserted {worst['label']}, reference implies {worst['derived']}",
+                "Per the entailment backend, these labels contradict what the reference "
+                "answer implies. Either the label is wrong, the reference is wrong, or "
+                "the oracle misread the pair - a human decides which, but the AUROC "
+                "above was fitted to the asserted labels as-is.",
+            )
+        else:
+            report.add(
+                "labels vs references",
+                PASS,
+                f"all {n_with_ref} referenced row(s) agree with their reference-implied label",
+            )
+
+    labeled_answers = [getattr(row, "labeled_answer", None) for row in labelled_rows]
+    if any(answer is not None for answer in labeled_answers):
+        stale = find_stale_labels(results, labeled_answers, backend)
+        n_with_prov = sum(1 for a in labeled_answers if a is not None)
+        if stale:
+            worst = stale[0]
+            report.add(
+                "label staleness",
+                WARN,
+                f"{len(stale)} of {n_with_prov} label(s) were judged against an answer "
+                f"the model no longer gives; e.g. {worst['prompt'][:36]!r}: labelled "
+                f"against {worst['labeled_answer'][:30]!r}, now says "
+                f"{worst['current_consensus'][:30]!r}",
+                "A label is a claim about a specific answer, not about a prompt. These "
+                "rows score the present model against a judgement about a past one. "
+                "Re-label them with `sem-gate label --relabel`.",
+            )
+        else:
+            report.add(
+                "label staleness",
+                PASS,
+                f"all {n_with_prov} provenance-carrying label(s) still match the "
+                "model's current consensus",
+            )
 
 
 def _needed_for(calibration: Any) -> str:

@@ -485,6 +485,36 @@ def cmd_label(args: argparse.Namespace) -> int:
         else:
             raise SemanticEntropyError(f"row {index} has no samples and no --sampler was given")
 
+        # A reference answer makes the label derivable instead of asked-for:
+        # equivalent -> 0, contradicts -> 1, and only the rows where the oracle
+        # abstains reach the human. Recording the derivation keeps it auditable.
+        if args.auto and row.reference:
+            from .validation import derive_label
+
+            derived, why = derive_label(
+                result.consensus_answer or "",
+                row.reference,
+                entailment,
+                context=result.prompt,
+            )
+            if derived is not None:
+                data = row.to_dict()
+                data["samples"] = [sample.text for sample in result.samples]
+                data["labeled_answer"] = result.consensus_answer
+                data["label_derivation"] = why
+                data[args.label_key] = derived
+                out_rows.append(data)
+                n_labelled += 1
+                print(
+                    f"[{index}/{len(rows)}] auto: label {derived} - {why[:60]}",
+                    file=sys.stderr,
+                )
+                continue
+            print(
+                f"[{index}/{len(rows)}] oracle abstained ({why[:50]}); asking you",
+                file=sys.stderr,
+            )
+
         print("=" * 70)
         print(f"[{index}/{len(rows)}] {result.prompt[:66]}")
         print(
@@ -512,6 +542,10 @@ def cmd_label(args: argparse.Namespace) -> int:
             continue
         data = row.to_dict()
         data["samples"] = [sample.text for sample in result.samples]
+        # Provenance: the label is a claim about THIS answer. Recording it makes
+        # staleness exact — if the model stops giving this answer, doctor flags
+        # the label instead of silently scoring the present against the past.
+        data["labeled_answer"] = result.consensus_answer
         data[args.label_key] = 0 if answer == "y" else 1
         out_rows.append(data)
         n_labelled += 1
@@ -682,6 +716,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_label.add_argument("--label-key", default="label")
     p_label.add_argument(
         "--relabel", action="store_true", help="re-ask even for rows that already carry a label"
+    )
+    p_label.add_argument(
+        "--auto",
+        action="store_true",
+        help="derive labels from a 'reference' field via entailment where possible; "
+        "only rows the oracle cannot decide reach you",
     )
     _add_scoring_args(p_label)
     p_label.set_defaults(func=cmd_label)

@@ -474,6 +474,42 @@ class Gate:
         if len(self.history) > self.max_history:
             del self.history[: len(self.history) - self.max_history]
 
+    def relabel_sample(self, k: int = 30, *, seed: int = 0) -> List[Dict[str, Any]]:
+        """A deterministic random sample of recent decisions, ready for `sem-gate label`.
+
+        The honest response to drift is re-labelling a sample of *current*
+        traffic — and "a sample" is where honesty quietly leaks: hand-picking
+        the prompts that look easy (or hard) biases the recalibration toward
+        the answer someone wants. This makes the sample **protocol instead of
+        trust**: seeded, drawn uniformly from the gate's own history, and
+        reproducible by anyone holding the same history and seed. Write the
+        rows to JSONL and label them:
+
+            write_jsonl("relabel.jsonl", gate.relabel_sample(30))
+            # sem-gate label --input relabel.jsonl --out dev2.jsonl ...
+
+        Generations are included, so labelling is offline and the scores are
+        re-derivable. Failed and unreliable measurements are excluded — they
+        carry no answer to judge.
+        """
+        import random as _random
+
+        eligible = [
+            d
+            for d in self.history
+            if d.result.reliable and not d.metadata.get("failed") and d.result.samples
+        ]
+        rng = _random.Random(seed)
+        chosen = eligible if len(eligible) <= k else rng.sample(eligible, k)
+        return [
+            {
+                "prompt": d.result.prompt,
+                "samples": [s.text for s in d.result.samples],
+                "labeled_answer": d.result.consensus_answer,
+            }
+            for d in chosen
+        ]
+
     def check_drift(self, calibration: Any, *, alpha: float = 0.01, min_live: int = 20):
         """Does live traffic still look like the dev set this gate was calibrated on?
 
