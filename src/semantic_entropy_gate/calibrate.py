@@ -20,6 +20,7 @@ scored correctly rather than optimistically.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .errors import CalibrationError
@@ -44,6 +45,25 @@ def _as_score(item: Scored, *, normalized: bool = True) -> float:
     if isinstance(item, EntropyResult):
         return item.score_for(normalized=normalized)
     return float(item)
+
+
+def _validate_scores(scores: Sequence[float]) -> List[float]:
+    """Reject non-finite scores instead of ranking them.
+
+    ``NaN`` compares ``False`` against everything, so Python's sort silently
+    produces an arbitrary order and the resulting AUROC is a plausible-looking
+    number computed from nonsense. A calibration that is quietly wrong is worse
+    than one that refuses to run, because its output is a deployed threshold.
+    """
+    bad = [i for i, s in enumerate(scores) if not math.isfinite(s)]
+    if bad:
+        preview = ", ".join(str(i) for i in bad[:5])
+        raise CalibrationError(
+            f"{len(bad)} score(s) are NaN or infinite (index {preview}"
+            f"{'...' if len(bad) > 5 else ''}). Ranking them would silently corrupt "
+            "the AUROC. Drop those rows, or fix the sampler that produced them."
+        )
+    return [float(s) for s in scores]
 
 
 def calibrate(
@@ -90,7 +110,7 @@ def calibrate(
     if criterion not in CRITERIA:
         raise CalibrationError(f"unknown criterion {criterion!r}; expected one of {CRITERIA}")
 
-    scores = [_as_score(r, normalized=normalized) for r in results]
+    scores = _validate_scores([_as_score(r, normalized=normalized) for r in results])
     ys = [1 if bool(y) else 0 for y in labels]
     n_pos = sum(ys)
     n_neg = len(ys) - n_pos
@@ -146,6 +166,7 @@ def auroc(scores: Sequence[float], labels: Sequence[int]) -> float:
     n_neg = len(labels) - n_pos
     if n_pos == 0 or n_neg == 0:
         raise CalibrationError("AUROC is undefined for a single-class label set")
+    scores = _validate_scores(scores)
 
     ranks = _mid_ranks(scores)
     rank_sum_pos = sum(r for r, y in zip(ranks, labels) if y == 1)
@@ -178,6 +199,7 @@ def auprc(scores: Sequence[float], labels: Sequence[int]) -> float:
     n_pos = sum(labels)
     if n_pos == 0:
         raise CalibrationError("AUPRC is undefined with no positive examples")
+    scores = _validate_scores(scores)
     order = sorted(range(len(scores)), key=lambda i: -scores[i])
     tp = 0
     fp = 0
@@ -214,6 +236,7 @@ def threshold_sweep(scores: Sequence[float], labels: Sequence[int]) -> List[Thre
     n_neg = len(labels) - n_pos
     if n_pos == 0 or n_neg == 0:
         raise CalibrationError("threshold sweep needs both classes present")
+    scores = _validate_scores(scores)
 
     candidates = sorted(set(scores))
     step = 1e-9 if len(candidates) < 2 else (candidates[-1] - candidates[0]) / 1000 or 1e-9

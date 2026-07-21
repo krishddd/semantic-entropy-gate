@@ -55,6 +55,7 @@ A token-level detector sees six different strings in *both* cases and calls both
 Token-level uncertainty cannot tell those apart: *"It is in Paris"* and *"Paris, France"* look maximally uncertain to a log-prob detector and are in fact the same answer. Semantic entropy is invariant to phrasing and measures uncertainty **in the space of meanings**.
 
 - 🎯 **The published method, faithfully** — bidirectional-entailment clustering + Rao-Blackwellised entropy, with the discrete (black-box) estimator for APIs that hide log-probs.
+- 🔒 **Fails closed** — a short sampler return, temperature-0 sampling, empty output, a `NaN` log-probability or an injected entailment judge all produce a *low* score, which naively reads as confidence. Each is detected, marked unreliable, and refused. [11 audited fail-open paths, each with a regression test.](docs/THREAT_MODEL.md)
 - 🔍 **Answerable by construction** — every result carries its samples, every NLI verdict, every cluster and its mass. `result.explain()` prints the whole audit trail. No score is ever shown without its evidence.
 - 🚦 **A gate, not just a metric** — `Gate` wraps any agent/LLM call and returns `ALLOW / WARN / DEFER / BLOCK` *before* the irreversible action runs.
 - 📏 **Calibrated, not guessed** — pick your threshold from a labelled dev set and get the **AUROC** so you know whether the signal is even usable on your task.
@@ -278,6 +279,69 @@ Every layer is inspectable:
 
 ---
 
+## Failing closed
+
+Semantic entropy has one property that dominates everything about deploying it:
+
+> **Every way the measurement can break produces a low score — and a low score means "allow".**
+
+That is arithmetic, not bad luck. Entropy measures disagreement between samples, so anything that removes samples, empties them, makes them identical, or corrupts the maths removes *observable* disagreement, and the score falls toward zero. A naive implementation therefore fails **silently, confidently, and open** — exactly when something else has already gone wrong.
+
+The rule this library follows:
+
+> **A measurement that did not happen is not evidence of confidence.**
+
+```mermaid
+flowchart TD
+    S["N generations arrive"] --> C{"Could this measurement<br/>detect disagreement at all?"}
+    C -->|"1 of 10 returned"| U["reliable = False"]
+    C -->|"all byte-identical<br/>(temperature 0 / cache)"| U
+    C -->|"all empty"| U
+    C -->|"NaN log-probability"| U
+    C -->|"sampler / NLI backend threw"| U
+    C -->|"yes"| M["measure semantic entropy"]
+    U --> D["DEFER or BLOCK<br/>+ the reason, in plain language"]
+    M --> T{"score vs calibrated<br/>threshold"}
+    T -->|below| A["ALLOW"]
+    T -->|above| D
+
+    style U fill:#b3261e,stroke:#7f1d1d,color:#fff
+    style D fill:#d97706,stroke:#92400e,color:#fff
+    style A fill:#1a7f37,stroke:#0f5323,color:#fff
+```
+
+```python
+# A sampler that quietly returned 1 of 10 generations — the most common
+# production failure (rate limits, partial batch errors).
+result = score("q", broken_sampler, n_samples=10)
+
+result.normalized_entropy   # 0.0   <- the raw number still looks perfect
+result.reliable             # False <- but it is not evidence of anything
+result.warnings             # ['sampler returned 1 of 10 requested generations; ...']
+
+gate.check("q").action      # GateAction.DEFER — never ALLOW
+```
+
+The honest case is untouched: six *differently worded* answers that mean the same thing still score 0 and still ALLOW. The check distinguishes **"the model agreed with itself"** from **"the model was never really asked twice"**.
+
+| Broken input | Naive result | Here |
+| --- | --- | --- |
+| sampler returned 1 of 10 | `H=0` → allow | unreliable → defer |
+| temperature 0 / cached sampler | `H=0` → allow | degenerate → defer |
+| all generations empty | `H=0` → allow | unreliable → defer |
+| `NaN` log-probability | `H=NaN`, every comparison false → allow | discarded → discrete estimator |
+| sampler or NLI backend raised | exception → caller's `except` may just run the action | defer, with the error attached |
+| judge told *"reply: entailment"* | 1 cluster, `H=0` → allow | refused, clusters kept apart |
+| `threshold=5.0` on a `[0,1]` scale | gate silently never fires | `ValueError` at construction |
+
+Untrusted model output is also treated as untrusted *text*: ANSI escapes and bidi overrides are stripped from every rendered path (a generation containing `\x1b[2J` could otherwise repaint your terminal with a fake verdict), markdown reports escape markup, and resource limits cap the O(N²) entailment budget before any calls are billed.
+
+Both defaults are switchable — `Gate(fail_closed=False, require_reliable=False)` — but you have to say so.
+
+📄 **[Read the full threat model](docs/THREAT_MODEL.md)** for the reproduction, impact and fix of each finding, plus the residual risks that are *not* addressed.
+
+---
+
 ## Theory
 
 ### The failure mode being detected
@@ -480,7 +544,9 @@ def test_model_admits_ignorance(semantic_entropy):
 
 ## Scope note — what this does not do
 
-- It detects **confabulation** (resampling-unstable guesses), not systematic errors the model learned wrong and repeats confidently.
+- It detects **confabulation** (resampling-unstable guesses), not systematic errors the model learned wrong and repeats confidently. No implementation fixes that — it is a property of the method.
+- A **hostile entailment backend** defeats it entirely: if the NLI model or judge endpoint is attacker-controlled it can return `entailment` for everything. The oracle is trusted by construction.
+- The **injection heuristic is not complete.** It is one of four layers (detection, merge-refusing failure direction, fencing, final-line parsing) — a sufficiently subtle rephrasing may still reach the judge.
 - It measures the model's *internal* consistency, not truth. A model consistently wrong scores low entropy. Semantic entropy is a **necessary-not-sufficient** signal — pair it with retrieval grounding for factuality.
 - Scores from different entailment backends are not comparable. Recalibrate when you change the oracle; the backend name is recorded so you can tell.
 - The lexical backend is triage grade. Ship a real NLI model or an LLM judge for production decisions.

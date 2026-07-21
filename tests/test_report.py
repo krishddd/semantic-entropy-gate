@@ -111,7 +111,7 @@ def test_markdown_truncates_very_long_cells():
     backend = LexicalEntailment()
     result = score_samples("q" * 400, ["x", "y"], entailment=backend)
     markdown = build_report([result]).to_markdown()
-    assert "..." in markdown
+    assert "…" in markdown
     assert "q" * 400 not in markdown
 
 

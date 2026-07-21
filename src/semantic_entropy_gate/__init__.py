@@ -16,13 +16,21 @@ Three surfaces
 - **Middleware** :class:`Gate` — allow / warn / defer / block any agent call
 - **CLI**        ``sem-gate score|calibrate|gate|report|explain|demo``
 
+Fails closed
+------------
+Every way this measurement can break — a short sampler return, identical
+generations, empty output, a NaN log-probability, an injected entailment judge —
+produces a *low* entropy, which naively reads as confidence. Such results are
+marked ``reliable=False`` and the gate treats them as uncertain, never as safe.
+See ``docs/THREAT_MODEL.md``.
+
 Method: Farquhar, Kossen, Kuhn & Gal, *Detecting hallucinations in large language
 models using semantic entropy*, Nature 630 (2024).
 """
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .active_inference import (
     Policy,
@@ -61,6 +69,16 @@ from .errors import (
 from .gate import DEFAULT_THRESHOLD, Gate, gate
 from .probes import SemanticEntropyProbe, TokenPosition
 from .report import Report, build_report
+from .safety import (
+    DEFAULT_LIMITS,
+    MIN_SAMPLES_FOR_ENTROPY,
+    IntegrityReport,
+    Limits,
+    check_samples,
+    escape_markdown,
+    looks_like_injection,
+    sanitize_text,
+)
 from .sampling import from_texts, openai_sampler, resolve_sampler
 from .score import DEFAULT_N_SAMPLES, score, score_batch, score_samples
 from .types import (
@@ -122,6 +140,15 @@ __all__ = [
     "rank_policies",
     "ambiguity_from_entropy",
     "should_forage",
+    # failsafe layer
+    "Limits",
+    "DEFAULT_LIMITS",
+    "MIN_SAMPLES_FOR_ENTROPY",
+    "IntegrityReport",
+    "check_samples",
+    "sanitize_text",
+    "escape_markdown",
+    "looks_like_injection",
     # reporting / data
     "Report",
     "build_report",

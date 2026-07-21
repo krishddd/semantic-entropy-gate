@@ -21,13 +21,20 @@ with it, so "the gate stopped my agent" is always answerable with evidence.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .entailment import EntailmentModel, auto_entailment
 from .errors import GateBlockedError
+from .safety import (
+    DEFAULT_LIMITS,
+    MIN_SAMPLES_FOR_ENTROPY,
+    Limits,
+    validate_threshold,
+)
 from .sampling import Sampler
 from .score import DEFAULT_N_SAMPLES, score, score_samples
-from .types import EntropyResult, GateAction, GateDecision
+from .types import EntropyResult, Estimator, GateAction, GateDecision
 
 __all__ = ["Gate", "gate", "DEFAULT_THRESHOLD"]
 
@@ -88,15 +95,28 @@ class Gate:
         raise_on_block: bool = False,
         record_history: bool = True,
         max_history: int = 1000,
+        fail_closed: bool = True,
+        require_reliable: bool = True,
+        limits: Limits = DEFAULT_LIMITS,
+        min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
     ) -> None:
-        if not 0.0 <= threshold:
-            raise ValueError("threshold must be non-negative")
+        config_warnings = validate_threshold(threshold, normalized=normalized)
         if warn_threshold is None:
             warn_threshold = 0.6 * threshold
+        else:
+            config_warnings += validate_threshold(
+                warn_threshold, normalized=normalized, name="warn_threshold"
+            )
         if warn_threshold > threshold:
             raise ValueError("warn_threshold must be <= threshold")
-        if block_threshold is not None and block_threshold < threshold:
-            raise ValueError("block_threshold must be >= threshold")
+        if block_threshold is not None:
+            config_warnings += validate_threshold(
+                block_threshold, normalized=normalized, name="block_threshold"
+            )
+            if block_threshold < threshold:
+                raise ValueError("block_threshold must be >= threshold")
+        for message in config_warnings:
+            warnings.warn(message, UserWarning, stacklevel=2)
 
         self.sampler = sampler
         self.threshold = threshold
@@ -111,12 +131,21 @@ class Gate:
         self.raise_on_block = raise_on_block
         self.record_history = record_history
         self.max_history = max_history
+        self.fail_closed = fail_closed
+        self.require_reliable = require_reliable
+        self.limits = limits
+        self.min_samples = min_samples
+        self.config_warnings = config_warnings
         self.history: List[GateDecision] = []
 
     # -------------------------------------------------------------- measuring
 
     def measure(self, prompt: str, **kwargs: Any) -> EntropyResult:
-        """Sample and score ``prompt`` without deciding anything."""
+        """Sample and score ``prompt`` without deciding anything.
+
+        Propagates exceptions. Use :meth:`check` if you want the failure turned
+        into a fail-closed decision instead of an exception.
+        """
         if self.sampler is None:
             raise ValueError("Gate has no sampler; use check_samples(prompt, samples) instead")
         return score(
@@ -125,23 +154,113 @@ class Gate:
             n_samples=kwargs.pop("n_samples", self.n_samples),
             entailment=self.entailment,
             strict=self.strict,
+            limits=kwargs.pop("limits", self.limits),
+            min_samples=kwargs.pop("min_samples", self.min_samples),
             **kwargs,
         )
 
     def check(self, prompt: str, **kwargs: Any) -> GateDecision:
-        """Sample, score and classify ``prompt`` into a :class:`GateDecision`."""
-        return self.decide(self.measure(prompt, **kwargs))
+        """Sample, score and classify ``prompt`` into a :class:`GateDecision`.
+
+        With ``fail_closed=True`` (the default) a sampler or entailment-backend
+        failure does not raise: it returns a DEFER/BLOCK decision carrying the
+        error. The alternative — an exception propagating into a caller whose
+        ``except`` clause falls back to "just run the action" — is how guardrails
+        get bypassed in production.
+        """
+        try:
+            return self.decide(self.measure(prompt, **kwargs))
+        except Exception as exc:  # noqa: BLE001 - deliberately broad: fail closed
+            if not self.fail_closed:
+                raise
+            return self._failure_decision(prompt, exc)
 
     def check_samples(self, prompt: str, samples: Sequence[Any], **kwargs: Any) -> GateDecision:
         """Decide from generations you already hold — no model call."""
-        result = score_samples(
-            prompt, samples, entailment=self.entailment, strict=self.strict, **kwargs
-        )
+        try:
+            result = score_samples(
+                prompt,
+                samples,
+                entailment=self.entailment,
+                strict=self.strict,
+                limits=kwargs.pop("limits", self.limits),
+                min_samples=kwargs.pop("min_samples", self.min_samples),
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - deliberately broad: fail closed
+            if not self.fail_closed:
+                raise
+            return self._failure_decision(prompt, exc)
         return self.decide(result)
 
+    def _failure_decision(self, prompt: str, exc: BaseException) -> GateDecision:
+        """Turn a measurement failure into the most conservative decision available.
+
+        BLOCK when the gate has a block threshold configured (the operator has
+        said some things must never run unverified); otherwise DEFER. Never
+        ALLOW: an uncertainty check that did not run has not shown the model was
+        certain.
+        """
+        action = GateAction.BLOCK if self.block_threshold is not None else GateAction.DEFER
+        result = EntropyResult(
+            prompt=prompt,
+            samples=[],
+            clusters=[],
+            entropy=float("inf"),
+            normalized_entropy=1.0,
+            naive_entropy=0.0,
+            estimator=Estimator.DISCRETE,
+            entailment_backend=self.entailment.name,
+            metadata={"error": f"{type(exc).__name__}: {exc}"},
+            warnings=[
+                f"uncertainty measurement failed ({type(exc).__name__}: {exc}); "
+                "treating the call as maximally uncertain"
+            ],
+            reliable=False,
+        )
+        decision = GateDecision(
+            action=action,
+            result=result,
+            threshold=self.threshold,
+            reason=f"measurement failed and the gate is fail-closed: {type(exc).__name__}: {exc}",
+            metadata={"failed": True, "error_type": type(exc).__name__, "score": 1.0},
+        )
+        self._record(decision)
+        return decision
+
     def decide(self, result: EntropyResult) -> GateDecision:
-        """Apply the threshold ladder to an already-computed result."""
+        """Apply the threshold ladder to an already-computed result.
+
+        An **unreliable** measurement short-circuits the ladder: a low score
+        produced by a pipeline that could not detect disagreement is not
+        evidence of agreement, so it is never allowed to open the gate. Set
+        ``require_reliable=False`` to opt out, which you should only do if you
+        have another check downstream.
+        """
         value = result.score_for(normalized=self.normalized)
+
+        if self.require_reliable and not result.reliable:
+            action = GateAction.BLOCK if self.block_threshold is not None else GateAction.DEFER
+            why = result.warnings[0] if result.warnings else "measurement marked unreliable"
+            decision = GateDecision(
+                action=action,
+                result=result,
+                threshold=self.threshold,
+                reason=(
+                    f"unreliable measurement (entropy {value:.3f} is not evidence of "
+                    f"confidence): {why}"
+                ),
+                metadata={
+                    "warn_threshold": self.warn_threshold,
+                    "block_threshold": self.block_threshold,
+                    "normalized": self.normalized,
+                    "score": value,
+                    "unreliable": True,
+                },
+            )
+            self._record(decision)
+            return decision
+
         if self.block_threshold is not None and value >= self.block_threshold:
             action = GateAction.BLOCK
             reason = f"semantic entropy {value:.3f} >= block threshold {self.block_threshold:.3f}"
@@ -162,6 +281,9 @@ class Gate:
                 f"{result.n_samples} samples (agreement {result.agreement:.0%}). "
                 f"Consensus answer may be unreliable."
             )
+        elif action is GateAction.ALLOW and result.warnings:
+            # Allowed, but the measurement had caveats worth carrying forward.
+            warning = "; ".join(result.warnings)
         decision = GateDecision(
             action=action,
             result=result,
@@ -173,6 +295,7 @@ class Gate:
                 "block_threshold": self.block_threshold,
                 "normalized": self.normalized,
                 "score": value,
+                "unreliable": not result.reliable,
             },
         )
         self._record(decision)

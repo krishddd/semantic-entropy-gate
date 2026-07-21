@@ -10,6 +10,7 @@ clusters. Everything each stage decided is preserved on the result.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -17,6 +18,14 @@ from .clustering import cluster as cluster_samples
 from .entailment import EntailmentModel, auto_entailment
 from .entropy import entropy_diagnostics, naive_string_entropy, semantic_entropy
 from .errors import SamplingError
+from .safety import (
+    DEFAULT_LIMITS,
+    MIN_SAMPLES_FOR_ENTROPY,
+    Limits,
+    check_samples,
+    guard_entropy,
+    has_unsafe_characters,
+)
 from .sampling import Sampler, resolve_sampler
 from .types import EntropyResult, Estimator, Sample, normalize_texts
 
@@ -38,6 +47,8 @@ def score(
     context: Optional[str] = None,
     judge: Optional[Any] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    limits: Limits = DEFAULT_LIMITS,
+    min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
 ) -> EntropyResult:
     """Score one prompt for semantic entropy.
 
@@ -62,11 +73,26 @@ def score(
     estimator:
         Force ``Estimator.RAO_BLACKWELL`` or ``Estimator.DISCRETE``. ``None``
         auto-selects on whether every sample carries a log-probability.
+    limits:
+        Resource ceilings (sample count, text length, NLI budget). See
+        :class:`~semantic_entropy_gate.safety.Limits`.
+    min_samples:
+        Below this the result is marked **unreliable** rather than confident: a
+        sampler that returned one generation is indistinguishable from a certain
+        model if you only look at the entropy.
 
     Raises
     ------
     SamplingError
         If the sampler yields nothing, or ``n_samples < 1``.
+
+    Notes
+    -----
+    The number of generations the sampler actually returned is compared against
+    ``n_samples``. A short return is the single most common silent failure in
+    production (rate limits, partial API errors) and it always biases the score
+    toward *confident*, so it is recorded and, when severe, marks the result
+    unreliable.
     """
     if n_samples < 1:
         raise SamplingError(f"n_samples must be >= 1, got {n_samples}")
@@ -88,6 +114,9 @@ def score(
         context=context,
         judge=judge,
         metadata=meta,
+        limits=limits,
+        min_samples=min_samples,
+        requested=n_samples,
     )
 
 
@@ -101,20 +130,47 @@ def score_samples(
     context: Optional[str] = None,
     judge: Optional[Any] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    limits: Limits = DEFAULT_LIMITS,
+    min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
+    requested: Optional[int] = None,
 ) -> EntropyResult:
     """Score generations you already have — no sampler, no model call.
 
     This is the offline path: batch-score a logged dataset, re-score with a
     different entailment backend, or reproduce a historical decision exactly.
+
+    The sample set is validated first (see
+    :func:`~semantic_entropy_gate.safety.check_samples`). Anything that would
+    make a low entropy *meaningless* rather than *reassuring* — too few
+    generations, byte-identical generations, empty output, poisoned
+    log-probabilities — marks the result ``reliable=False`` and is listed in
+    ``result.warnings``. Nothing is dropped silently.
     """
-    normalized: List[Sample] = normalize_texts(list(samples))
-    if not normalized:
-        raise SamplingError("no samples to score")
+    raw: List[Sample] = normalize_texts(list(samples))
+    integrity = check_samples(raw, limits=limits, min_samples=min_samples, requested=requested)
+    normalized: List[Sample] = integrity.samples
 
     if entailment is None:
         entailment = auto_entailment(judge=judge)
 
     nli_context = prompt if context is None else context
+    if len(nli_context) > limits.max_prompt_chars:
+        nli_context = nli_context[: limits.max_prompt_chars]
+        integrity.add(
+            f"prompt truncated to {limits.max_prompt_chars} characters for entailment context"
+        )
+
+    # Bound the O(N^2) NLI cost before doing any of it. Refusing up front beats
+    # discovering the bill afterwards.
+    n = len(normalized)
+    worst_case_calls = n * (n - 1)
+    if worst_case_calls > limits.max_entailment_calls:
+        raise SamplingError(
+            f"{n} generations would need up to {worst_case_calls} entailment calls, "
+            f"above the limit of {limits.max_entailment_calls}. Lower n_samples or raise "
+            "Limits(max_entailment_calls=...) deliberately."
+        )
+
     started = time.time()
     outcome = cluster_samples(normalized, entailment, context=nli_context, strict=strict)
     elapsed_clustering = time.time() - started
@@ -122,17 +178,41 @@ def score_samples(
     entropy, probabilities, used = semantic_entropy(
         outcome.clusters, normalized, estimator=estimator
     )
+    entropy, entropy_warning = guard_entropy(entropy)
+    if entropy_warning:
+        integrity.add(entropy_warning, fatal=True)
     for semantic_cluster, probability in zip(outcome.clusters, probabilities):
         semantic_cluster.probability = probability
 
     naive = naive_string_entropy(normalized)
     max_entropy = _log(len(normalized))
-    normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+    if max_entropy > 0 and math.isfinite(entropy):
+        normalized_entropy = min(1.0, entropy / max_entropy)
+    elif not math.isfinite(entropy):
+        # Unknown uncertainty reads as maximal uncertainty, never as confidence.
+        normalized_entropy = 1.0
+    else:
+        normalized_entropy = 0.0
+
+    tampered = sum(1 for s in normalized if has_unsafe_characters(s.text))
+    if tampered:
+        integrity.add(
+            f"{tampered} generation(s) contain terminal control characters or bidirectional "
+            "overrides; they are stripped from every rendered report, but their presence "
+            "suggests the output is trying to alter what a reviewer sees"
+        )
+
+    if not strict:
+        integrity.add(
+            "relaxed entailment clustering is in use: it merges more answers and therefore "
+            "reports lower entropy than the strict rule the threshold was calibrated on"
+        )
 
     meta = dict(metadata or {})
     meta["clustering_seconds"] = round(elapsed_clustering, 4)
     meta["entailment_calls"] = len(outcome.judgements)
     meta["strict_entailment"] = strict
+    meta["integrity"] = integrity.to_dict()
     meta.update(entropy_diagnostics(outcome.clusters, normalized, entropy))
 
     return EntropyResult(
@@ -140,13 +220,15 @@ def score_samples(
         samples=normalized,
         clusters=outcome.clusters,
         entropy=entropy,
-        normalized_entropy=min(1.0, normalized_entropy),
+        normalized_entropy=normalized_entropy,
         naive_entropy=naive,
         estimator=used,
         judgements=outcome.judgements,
         entailment_backend=entailment.name,
         cluster_assignments=outcome.assignments,
         metadata=meta,
+        warnings=list(integrity.warnings),
+        reliable=integrity.reliable,
     )
 
 
@@ -185,6 +267,4 @@ def score_batch(
 
 
 def _log(n: int) -> float:
-    import math
-
     return math.log(n) if n > 1 else 0.0

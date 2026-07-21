@@ -150,6 +150,16 @@ class EntropyResult:
     entailment_backend: str = ""
     cluster_assignments: List[int] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+    reliable: bool = True
+    """Whether this measurement is capable of detecting disagreement at all.
+
+    ``False`` means the pipeline broke in a way that *manufactures* a low score:
+    too few generations, byte-identical generations, empty output, a poisoned
+    log-probability. A low entropy from an unreliable measurement is not
+    evidence of confidence, and :class:`~semantic_entropy_gate.gate.Gate`
+    refuses to treat it as such.
+    """
 
     # ------------------------------------------------------------------ views
 
@@ -198,8 +208,18 @@ class EntropyResult:
 
         ``normalized=True`` compares against :attr:`normalized_entropy` (the
         sample-count-independent score); pass ``False`` to threshold raw nats.
+
+        **Fails closed.** A non-finite score (``NaN`` from a poisoned
+        log-probability) would make every ``>=`` comparison ``False`` and read as
+        confidence; here it returns ``True`` instead. An *unreliable* measurement
+        (see :attr:`reliable`) also returns ``True``: if the pipeline could not
+        actually look for disagreement, it has not shown there is none.
         """
         value = self.normalized_entropy if normalized else self.entropy
+        if not math.isfinite(value):
+            return True
+        if not self.reliable:
+            return True
         return value >= threshold
 
     def score_for(self, *, normalized: bool = True) -> float:
@@ -221,13 +241,17 @@ class EntropyResult:
         This is what you show a developer (or paste into an incident ticket) when
         they ask *"why did the gate stop my agent?"*.
         """
+        from .safety import sanitize_text
+
+        def clean(text: str, budget: int) -> str:
+            """Untrusted model output, made safe to print and clipped to width."""
+            flat = " ".join(sanitize_text(text).split())
+            return flat if len(flat) <= budget else flat[: budget - 3] + "..."
+
         bar = "=" * width
         rule = "-" * width
         lines = [bar, "SEMANTIC ENTROPY REPORT", bar]
-        prompt = self.prompt.replace("\n", " ")
-        if len(prompt) > width - 10:
-            prompt = prompt[: width - 13] + "..."
-        lines.append(f"Prompt:    {prompt}")
+        lines.append(f"Prompt:    {clean(self.prompt, width - 10)}")
         lines.append(
             f"Samples:   {self.n_samples}   Clusters: {self.n_clusters}   "
             f"Estimator: {self.estimator.value}"
@@ -243,26 +267,38 @@ class EntropyResult:
             f"-> lexical-only component {self.lexical_entropy:.4f}"
         )
         lines.append(f"Majority-cluster agreement: {self.agreement:.1%}")
+
+        if not self.reliable or self.warnings:
+            lines.append(rule)
+            header = (
+                "MEASUREMENT NOT RELIABLE - this score is not evidence of confidence"
+                if not self.reliable
+                else "MEASUREMENT NOTES"
+            )
+            lines.append(header)
+            for warning in self.warnings:
+                for index, chunk in enumerate(_wrap(sanitize_text(warning), width - 4)):
+                    lines.append(("  - " if index == 0 else "    ") + chunk)
+
         lines.append(rule)
         lines.append("SEMANTIC CLUSTERS (meaning groups the model produced)")
         for cid, size, prob, rep in self.cluster_table():
-            filled = int(round(prob * 20))
+            filled = max(0, min(20, int(round(prob * 20))))
             meter = "#" * filled + "." * (20 - filled)
-            text = rep.replace("\n", " ")
-            if len(text) > width - 34:
-                text = text[: width - 37] + "..."
-            lines.append(f"  [{cid}] p={prob:6.3f} |{meter}| n={size:<3d} {text}")
+            lines.append(f"  [{cid}] p={prob:6.3f} |{meter}| n={size:<3d} {clean(rep, width - 34)}")
         if self.n_clusters > 1:
             lines.append(rule)
             lines.append("DISAGREEMENT: the model asserted mutually exclusive answers.")
             for cid, _size, prob, rep in self.cluster_table()[:4]:
-                text = rep.replace("\n", " ")
-                if len(text) > width - 22:
-                    text = text[: width - 25] + "..."
-                lines.append(f"  cluster {cid} ({prob:.0%}): {text}")
+                lines.append(f"  cluster {cid} ({prob:.0%}): {clean(rep, width - 22)}")
         if threshold is not None:
             flagged = self.is_confabulation(threshold)
-            verdict = "CONFABULATION SUSPECTED" if flagged else "within confidence budget"
+            if not self.reliable:
+                verdict = "TREATED AS UNCERTAIN (measurement unreliable)"
+            elif flagged:
+                verdict = "CONFABULATION SUSPECTED"
+            else:
+                verdict = "within confidence budget"
             lines.append(rule)
             lines.append(
                 f"Threshold {threshold:.3f} (normalized) -> "
@@ -290,6 +326,8 @@ class EntropyResult:
             "entailment_backend": self.entailment_backend,
             "n_samples": self.n_samples,
             "n_clusters": self.n_clusters,
+            "reliable": self.reliable,
+            "warnings": list(self.warnings),
             "metadata": dict(self.metadata),
         }
         if include_judgements:
@@ -330,6 +368,10 @@ class EntropyResult:
             entailment_backend=data.get("entailment_backend", ""),
             cluster_assignments=list(data.get("cluster_assignments", [])),
             metadata=dict(data.get("metadata", {})),
+            warnings=list(data.get("warnings", [])),
+            # Absent in v0.1.0 reports. Default to reliable so old artefacts keep
+            # deserialising, but a missing flag is recorded rather than assumed.
+            reliable=bool(data.get("reliable", True)),
         )
 
 
@@ -469,6 +511,23 @@ class CalibrationResult:
                 bar,
             ]
         )
+
+
+def _wrap(text: str, width: int) -> List[str]:
+    """Minimal greedy word-wrap (no textwrap import for one call site)."""
+    words = text.split()
+    if not words:
+        return [""]
+    lines: List[str] = []
+    current = words[0]
+    for word in words[1:]:
+        if len(current) + 1 + len(word) <= width:
+            current = f"{current} {word}"
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
 
 
 def _json_safe(value: Any) -> bool:

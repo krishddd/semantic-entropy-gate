@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from .safety import escape_markdown
 from .types import CalibrationResult, EntropyResult, GateDecision
 
 __all__ = ["Report", "build_report", "write_json", "write_markdown"]
@@ -56,6 +57,8 @@ class Report:
             "threshold": threshold,
             "flagged": len(flagged),
             "flag_rate": (len(flagged) / n) if threshold is not None else None,
+            "unreliable": sum(1 for r in self.results if not r.reliable),
+            "with_warnings": sum(1 for r in self.results if r.warnings),
             "entailment_backends": sorted({r.entailment_backend for r in self.results}),
             "estimators": sorted({r.estimator.value for r in self.results}),
             "total_samples": sum(r.n_samples for r in self.results),
@@ -194,7 +197,18 @@ def _render_markdown(report: Report, *, top_k: int) -> str:
         lines.append(
             f"| Flagged as confabulation | {summary['flagged']} ({summary['flag_rate']:.1%}) |"
         )
+    lines.append(f"| Unreliable measurements | {summary['unreliable']} |")
     lines.append("")
+    if summary["unreliable"]:
+        lines += [
+            f"> ⛔ **{summary['unreliable']} of {summary['n_prompts']} measurements are "
+            "unreliable.** Those prompts produced a score that cannot distinguish "
+            '"the model agreed with itself" from "the pipeline never gave it the chance to '
+            'disagree" — too few generations, identical generations, empty output, or a '
+            "poisoned log-probability. They are counted as uncertain, not as confident. "
+            "See the per-prompt notes below.",
+            "",
+        ]
 
     if report.calibration:
         cal = report.calibration
@@ -280,9 +294,23 @@ def _render_result(result: EntropyResult, threshold: Optional[float]) -> List[st
     verdict = ""
     if threshold is not None:
         verdict = " — **flagged**" if result.is_confabulation(threshold) else " — within budget"
+    if not result.reliable:
+        verdict = " — ⛔ **measurement unreliable**"
     lines = [
         f"### `{_cell(result.prompt)}`{verdict}",
         "",
+    ]
+    if result.warnings:
+        lines.append(
+            "> **Measurement notes** — a low score here is not evidence of confidence."
+            if not result.reliable
+            else "> **Measurement notes**"
+        )
+        lines.append(">")
+        for warning in result.warnings:
+            lines.append(f"> - {escape_markdown(warning, limit=300)}")
+        lines.append("")
+    lines += [
         f"- semantic entropy **{result.entropy:.4f} nats** "
         f"(normalized **{result.normalized_entropy:.4f}**, max {result.max_entropy:.4f})",
         f"- naive string entropy {result.naive_entropy:.4f} nats "
@@ -366,12 +394,14 @@ def _ascii_roc(calibration: CalibrationResult, width: int = 46, height: int = 16
 
 
 def _cell(text: str, limit: int = 90) -> str:
-    """Markdown-table-safe one-liner."""
-    flat = " ".join(str(text).split())
-    flat = flat.replace("|", "\\|")
-    if len(flat) > limit:
-        flat = flat[: limit - 3] + "..."
-    return flat
+    """Markdown-table-safe one-liner from **untrusted** model output.
+
+    Reports embed generations verbatim and are rendered as HTML by GitHub and
+    most wikis. Escaping (rather than merely replacing ``|``) stops a generation
+    from closing the surrounding ``<details>`` element, injecting markup, or
+    smuggling terminal escapes into a page a reviewer trusts.
+    """
+    return escape_markdown(text, limit=limit)
 
 
 def _calibrated(calibration: Optional[CalibrationResult]) -> Optional[float]:

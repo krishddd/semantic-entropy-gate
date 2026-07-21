@@ -440,8 +440,13 @@ def cmd_demo(args: argparse.Namespace) -> int:
 def cmd_gate(args: argparse.Namespace) -> int:
     """Gate a single prompt from the command line."""
     entailment = _build_entailment(args)
+    n_samples = args.n_samples
     if args.samples:
         sampler = from_texts(args.samples)
+        # The generations were supplied directly, so asking for more than were
+        # given would (correctly) be reported as a short sampler return and mark
+        # the measurement unreliable. Ask for exactly what is here.
+        n_samples = len(args.samples)
     elif args.sampler:
         sampler = resolve_sampler(_load_entrypoint(args.sampler))
     else:
@@ -450,7 +455,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
         sampler,
         threshold=args.threshold if args.threshold is not None else DEFAULT_THRESHOLD,
         block_threshold=args.block_threshold,
-        n_samples=args.n_samples,
+        n_samples=n_samples,
         entailment=entailment,
         strict=not args.relaxed,
     )
