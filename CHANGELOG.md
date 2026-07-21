@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-21
+
+Closes the last finding from the v0.2.0 audit — **V7**, which was initially
+triaged as "by design". That triage was wrong, and the reasoning is worth
+recording: semantic entropy asks *did the model mean the same thing every time?*,
+a refusing model is consistent, so a low score is correct. All true, and all
+irrelevant to the consequence. The gate exists to decide whether an irreversible
+action may run, and it was authorising one on the strength of ten repetitions of
+"I don't know". **The metric was right; the decision was wrong.**
+
+### Added
+
+- **`refusal` module** — `PatternRefusalDetector` (stdlib default, ~20 phrase
+  families), `LLMRefusalDetector` (judge-based, fenced against injection),
+  `CallableRefusalDetector` (bring your own), `NullRefusalDetector` (off), and
+  `RefusalReport` / `detect_refusals`.
+- **`EntropyResult.abstained` and `.refusal_rate`** — a second, orthogonal axis
+  to `reliable`. `reliable` answers *did the measurement work?*; `abstained`
+  answers *did the model actually answer?* A unanimous refusal is a **reliable
+  measurement of a non-answer**, and folding it into `reliable` would make one
+  flag mean two things — "your sampler is broken" and "your model is being
+  careful" — which are opposite problems with opposite remedies.
+- **`Gate(refusal_policy=...)`** — `"defer"` (default; exactly the right response
+  to an honest "I don't know" — go and find out), `"block"`, or `"allow"` to
+  restore pre-0.3.0 behaviour. Under `"allow"` the abstention still travels on
+  `decision.warning`.
+- **`tests/test_refusal.py`** — 70 tests. Twenty genuine refusals, and ten
+  near-miss *answers* that a naive keyword matcher would wrongly flag, because
+  the false-positive direction is what decides whether the gate stays switched
+  on:
+
+  ```
+  "I don't know."                                   -> refusal
+  "I'm not sure, but I believe it is Canberra."     -> answer
+  "I don't know why it fails; the fix is a retry."  -> answer
+  ```
+
+  The rule: strip the matched refusal phrase, count what remains; fewer than
+  three content words means abstention.
+- Abstentions surfaced in `explain()`, both report formats, and `Gate.stats()`.
+
+### Changed
+
+- Gate warnings now **accumulate** instead of overwriting. A call that was both
+  borderline *and* a non-answer previously reported only the entropy caveat —
+  the dropped one was the one the reader needed.
+- Partial refusals are recorded as a `refusal_rate` without abstaining: the model
+  could not decide whether it knows, which entropy usually catches anyway.
+
+- CI gains a smoke test asserting that a unanimous "I don't know" exits non-zero
+  from `sem-gate gate`, so the V7 fix is verified against the installed console
+  script and not only in-process.
+
 ## [0.2.0] - 2026-07-21
 
 Failsafe release. An audit of v0.1.0 found **11 reproducible fail-open paths** —
@@ -121,5 +174,6 @@ First public release. Implements semantic entropy for hallucination detection
 - Zero runtime dependencies; MIT licensed; CI across Python 3.9–3.12 with lint,
   tests, an offline CLI smoke test and a clean-env wheel install check.
 
+[0.3.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.3.0
 [0.2.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.1.0

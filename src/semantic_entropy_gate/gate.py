@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .entailment import EntailmentModel, auto_entailment
 from .errors import GateBlockedError
+from .refusal import RefusalDetector
 from .safety import (
     DEFAULT_LIMITS,
     MIN_SAMPLES_FOR_ENTROPY,
@@ -36,7 +37,17 @@ from .sampling import Sampler
 from .score import DEFAULT_N_SAMPLES, score, score_samples
 from .types import EntropyResult, Estimator, GateAction, GateDecision
 
-__all__ = ["Gate", "gate", "DEFAULT_THRESHOLD"]
+__all__ = ["Gate", "gate", "DEFAULT_THRESHOLD", "REFUSAL_POLICIES"]
+
+REFUSAL_POLICIES = ("defer", "block", "allow")
+"""What to do when every generation declined to answer.
+
+``"defer"`` (default) hands control back — the agent should retrieve, ask, or
+escalate, which is precisely what an honest "I don't know" calls for.
+``"block"`` refuses outright. ``"allow"`` restores the pre-0.3.0 behaviour of
+reading the (legitimately low) entropy as permission; the abstention still
+travels on the decision as a warning.
+"""
 
 DEFAULT_THRESHOLD = 0.55
 """Uncalibrated default on the *normalised* entropy scale.
@@ -99,6 +110,8 @@ class Gate:
         require_reliable: bool = True,
         limits: Limits = DEFAULT_LIMITS,
         min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
+        refusal_policy: str = "defer",
+        refusal_detector: Optional[RefusalDetector] = None,
     ) -> None:
         config_warnings = validate_threshold(threshold, normalized=normalized)
         if warn_threshold is None:
@@ -131,10 +144,16 @@ class Gate:
         self.raise_on_block = raise_on_block
         self.record_history = record_history
         self.max_history = max_history
+        if refusal_policy not in REFUSAL_POLICIES:
+            raise ValueError(
+                f"refusal_policy must be one of {REFUSAL_POLICIES}, got {refusal_policy!r}"
+            )
         self.fail_closed = fail_closed
         self.require_reliable = require_reliable
         self.limits = limits
         self.min_samples = min_samples
+        self.refusal_policy = refusal_policy
+        self.refusal_detector = refusal_detector
         self.config_warnings = config_warnings
         self.history: List[GateDecision] = []
 
@@ -156,6 +175,7 @@ class Gate:
             strict=self.strict,
             limits=kwargs.pop("limits", self.limits),
             min_samples=kwargs.pop("min_samples", self.min_samples),
+            refusal_detector=kwargs.pop("refusal_detector", self.refusal_detector),
             **kwargs,
         )
 
@@ -185,6 +205,7 @@ class Gate:
                 strict=self.strict,
                 limits=kwargs.pop("limits", self.limits),
                 min_samples=kwargs.pop("min_samples", self.min_samples),
+                refusal_detector=kwargs.pop("refusal_detector", self.refusal_detector),
                 **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - deliberately broad: fail closed
@@ -261,6 +282,32 @@ class Gate:
             self._record(decision)
             return decision
 
+        if result.abstained and self.refusal_policy != "allow":
+            # The measurement is sound and the entropy is genuinely low — the
+            # model is consistent. It is consistently declining to answer, and a
+            # non-answer is not authorisation to act.
+            action = GateAction.BLOCK if self.refusal_policy == "block" else GateAction.DEFER
+            decision = GateDecision(
+                action=action,
+                result=result,
+                threshold=self.threshold,
+                reason=(
+                    f"model declined to answer in all {result.n_samples} generations; "
+                    f"semantic entropy {value:.3f} reflects a consistent NON-ANSWER, "
+                    "not a confident one"
+                ),
+                metadata={
+                    "warn_threshold": self.warn_threshold,
+                    "block_threshold": self.block_threshold,
+                    "normalized": self.normalized,
+                    "score": value,
+                    "abstained": True,
+                    "refusal_rate": result.refusal_rate,
+                },
+            )
+            self._record(decision)
+            return decision
+
         if self.block_threshold is not None and value >= self.block_threshold:
             action = GateAction.BLOCK
             reason = f"semantic entropy {value:.3f} >= block threshold {self.block_threshold:.3f}"
@@ -274,16 +321,25 @@ class Gate:
             action = GateAction.ALLOW
             reason = f"semantic entropy {value:.3f} < warn threshold {self.warn_threshold:.3f}"
 
-        warning = None
+        # Caveats accumulate rather than overwrite each other: an allowed call
+        # that was *both* borderline and a non-answer must carry both facts, or
+        # the one that got dropped is the one the reader needed.
+        notes: List[str] = []
         if action is GateAction.WARN:
-            warning = (
+            notes.append(
                 f"Model uncertainty elevated: {result.n_clusters} distinct meanings across "
                 f"{result.n_samples} samples (agreement {result.agreement:.0%}). "
                 f"Consensus answer may be unreliable."
             )
-        elif action is GateAction.ALLOW and result.warnings:
-            # Allowed, but the measurement had caveats worth carrying forward.
-            warning = "; ".join(result.warnings)
+        if result.abstained:
+            notes.append(
+                f"The model declined to answer in all {result.n_samples} generations "
+                f"(refusal_policy={self.refusal_policy!r}); the low score reflects a "
+                "consistent non-answer."
+            )
+        if action.allowed and result.warnings:
+            notes.extend(result.warnings)
+        warning = " ".join(notes) if notes else None
         decision = GateDecision(
             action=action,
             result=result,
@@ -409,6 +465,8 @@ class Gate:
             "warn_threshold": self.warn_threshold,
             "block_threshold": self.block_threshold,
             "entailment_backend": self.entailment.name,
+            "abstentions": sum(1 for d in self.history if d.result.abstained),
+            "unreliable": sum(1 for d in self.history if not d.result.reliable),
         }
 
 

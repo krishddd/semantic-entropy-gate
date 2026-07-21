@@ -58,7 +58,7 @@ trail, **medium** = cost/availability.
 | V14 | Unbounded O(N²) entailment calls | medium | fixed |
 | V15 | Unbounded generation length reaches the tokenizer | medium | fixed |
 | V17 | Relaxed clustering lowers entropy with no marker | low | fixed |
-| V7 | Unanimous refusal ("I don't know") scores low entropy | by design | documented |
+| V7 | Unanimous refusal ("I don't know") reads as confidence | high | fixed in 0.3.0 |
 
 ---
 
@@ -277,19 +277,56 @@ strict clustering. Now recorded as a warning on every affected result.
 
 ---
 
-### V7 — Unanimous refusal (accepted behaviour, not a bug)
+### V7 — Unanimous refusal reads as confidence
 
 ```python
-score_samples("q", ["I don't know.", "I do not know.", "Unknown."])
+score_samples("Who was CEO of Helix Ltd in 2015?",
+              ["I don't know.", "I do not know.", "I don't know", "I don't know!"])
+# normalized entropy 0.406 -> below a 0.55 threshold -> ALLOW
 ```
 
-The model consistently refuses, so semantic entropy is genuinely low: it *is*
-confident, about not knowing. The gate correctly reports low uncertainty.
+**Initially triaged as "by design", and that was wrong.** The reasoning was:
+semantic entropy asks *did the model mean the same thing every time?*, the model
+was consistent, so a low score is correct. All true — and irrelevant to the
+consequence. The gate exists to decide whether an irreversible action may run,
+and it was authorising one on the strength of ten repetitions of *"I don't
+know"*. The uncertainty was surfaced perfectly and then discarded at the last
+step.
 
-This is a real limitation but not a defect in the metric — detecting refusals is
-a different task (a classifier on the answer), and conflating the two would make
-the entropy score mean two things at once. Documented in the scope note; not
-"fixed".
+The metric was right; the **decision** was wrong. That distinction is what makes
+this a gate bug rather than a metric limitation, and it is why the fix lives in
+the gate and not in the entropy.
+
+**Why it is not simply "unreliable".** A refusal is a *successful* measurement of
+a *non-answer*. Folding it into `reliable=False` would make one flag mean two
+things — "your sampler is broken" and "your model is being careful" — which are
+opposite problems with opposite remedies. So 0.3.0 adds a second, orthogonal
+axis:
+
+| Flag | Question it answers |
+| --- | --- |
+| `reliable` | Did the measurement work at all? |
+| `abstained` | Did the model actually answer? |
+
+**Fix.** A new [`refusal`](../src/semantic_entropy_gate/refusal.py) module scans
+every generation. `Gate(refusal_policy="defer")` (default) treats a unanimous
+abstention as DEFER — which is exactly the right response to an honest "I don't
+know": go and find out. `"block"` and `"allow"` are available; under `"allow"`
+the abstention still travels on `decision.warning`.
+
+**The hard part was the false-positive direction.** A detector that fires on
+
+> "I don't know why the timeout fires, but the fix is to raise it to 30 seconds."
+
+would defer good answers and get the gate switched off. `PatternRefusalDetector`
+therefore removes the matched refusal phrase and counts what remains: fewer than
+three content words means abstention, otherwise it is an answer with a hedge in
+front. The test suite pins ten such near-miss answers alongside twenty genuine
+refusals.
+
+**Partial refusals** (some generations answer, some decline) are reported as a
+`refusal_rate` but do not abstain — the model could not decide whether it knows,
+which is itself a strong uncertainty signal that entropy usually catches anyway.
 
 ---
 
@@ -313,19 +350,27 @@ itself a hazard.
    allowed. This is a property of the method, stated in the paper and in
    [docs/theory.md](theory.md), and no implementation fixes it. **Pair the gate
    with retrieval grounding for factuality.**
-4. **Timeouts.** A hung sampler or judge blocks the calling thread; the library
+4. **Refusals phrased outside the pattern list.** `PatternRefusalDetector` is
+   English and phrase-based; "the record is silent on this" or a non-English
+   abstention will read as an answer. Extend it with `extra_patterns=`, swap in
+   `LLMRefusalDetector`, or supply your own via `CallableRefusalDetector`. Note
+   the failure direction: a *missed* refusal falls back to the ordinary entropy
+   check, which frequently catches it anyway because differently-worded
+   refusals do not cluster.
+5. **Timeouts.** A hung sampler or judge blocks the calling thread; the library
    imposes no wall-clock limit (doing so portably requires threads or async and
    would change the API). Set timeouts on your own client.
-5. **Arbitrary code execution via CLI entrypoints.** `--sampler pkg.mod:fn`
+6. **Arbitrary code execution via CLI entrypoints.** `--sampler pkg.mod:fn`
    imports and calls the named object by design. Never pass an untrusted value
    to it — it is equivalent to `python -c`.
-6. **Cache growth.** `CachedEntailment` is bounded by `maxsize` but does not
+7. **Cache growth.** `CachedEntailment` is bounded by `maxsize` but does not
    evict; once full it stops caching. Bounded memory, degraded hit rate.
 
 ## Verifying the fixes yourself
 
 ```bash
-pytest tests/test_safety.py -v      # 68 regression tests, one per finding
+pytest tests/test_safety.py -v     # 68 regression tests: the failsafe findings
+pytest tests/test_refusal.py -v    # 70 regression tests: refusal vs answer (V7)
 ```
 
 Each test is written from the attacker's side — *can I get ALLOW out of this?* —

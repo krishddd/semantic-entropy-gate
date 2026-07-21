@@ -69,6 +69,20 @@ jobs:
           python examples/quickstart.py
           python examples/gate_an_agent.py
           python examples/calibrate_threshold.py
+          python examples/refusal_aware_gate.py
+      - name: A non-answer must not open the gate (exit code 2 == not allowed)
+        run: |
+          set +e
+          sem-gate gate "Who was CEO of Helix Ltd in 2015?" \
+            --entailment lexical \
+            --samples "I don't know." \
+            --samples "I do not know." \
+            --samples "I don't know" \
+            --samples "I don't know!"
+          code=$?
+          set -e
+          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
+          echo "non-answer correctly refused"
 
   build:
     name: Build distribution

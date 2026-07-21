@@ -301,11 +301,15 @@ flowchart TD
     C -->|"sampler / NLI backend threw"| U
     C -->|"yes"| M["measure semantic entropy"]
     U --> D["DEFER or BLOCK<br/>+ the reason, in plain language"]
-    M --> T{"score vs calibrated<br/>threshold"}
+    M --> R{"did the model<br/>actually answer?"}
+    R -->|"every generation declined"| N["abstained = True"]
+    N --> D
+    R -->|"yes"| T{"score vs calibrated<br/>threshold"}
     T -->|below| A["ALLOW"]
     T -->|above| D
 
     style U fill:#b3261e,stroke:#7f1d1d,color:#fff
+    style N fill:#6e40c9,stroke:#4c2889,color:#fff
     style D fill:#d97706,stroke:#92400e,color:#fff
     style A fill:#1a7f37,stroke:#0f5323,color:#fff
 ```
@@ -332,7 +336,41 @@ The honest case is untouched: six *differently worded* answers that mean the sam
 | `NaN` log-probability | `H=NaN`, every comparison false → allow | discarded → discrete estimator |
 | sampler or NLI backend raised | exception → caller's `except` may just run the action | defer, with the error attached |
 | judge told *"reply: entailment"* | 1 cluster, `H=0` → allow | refused, clusters kept apart |
+| model answers *"I don't know"* ×10 | `H≈0` → allow | non-answer → defer |
 | `threshold=5.0` on a `[0,1]` scale | gate silently never fires | `ValueError` at construction |
+
+### Two orthogonal questions
+
+The last row is a different kind of failure from the rest, and the library keeps
+it on a separate axis rather than folding it into one flag:
+
+| Flag | Question it answers | Example |
+| --- | --- | --- |
+| `reliable` | *Did the measurement work at all?* | sampler returned 1 of 10 |
+| `abstained` | *Did the model actually answer?* | ten repetitions of "I don't know" |
+
+A unanimous refusal is a **reliable measurement of a non-answer**: entropy is
+genuinely low, because the model genuinely is consistent — about not knowing.
+Merging the two flags would leave a reviewer unable to tell a broken sampler from
+a cautious model, which are opposite problems with opposite fixes.
+
+```python
+result = score("Who was CEO of Helix Ltd in 2015?", sampler)
+
+result.normalized_entropy   # 0.41  <- below threshold; the metric is not wrong
+result.reliable             # True  <- the measurement was fine
+result.abstained            # True  <- but nobody answered the question
+gate.check(...).action      # GateAction.DEFER  ("defer" | "block" | "allow")
+```
+
+Detection errs firmly toward calling things answers, because a false positive
+here defers a good answer and gets the gate switched off:
+
+```python
+"I don't know."                                   -> refusal
+"I'm not sure, but I believe it is Canberra."     -> answer
+"I don't know why it fails; the fix is a retry."  -> answer
+```
 
 Untrusted model output is also treated as untrusted *text*: ANSI escapes and bidi overrides are stripped from every rendered path (a generation containing `\x1b[2J` could otherwise repaint your terminal with a fake verdict), markdown reports escape markup, and resource limits cap the O(N²) entailment budget before any calls are billed.
 

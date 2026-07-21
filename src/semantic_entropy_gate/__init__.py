@@ -30,7 +30,7 @@ models using semantic entropy*, Nature 630 (2024).
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .active_inference import (
     Policy,
@@ -66,8 +66,18 @@ from .errors import (
     SamplingError,
     SemanticEntropyError,
 )
-from .gate import DEFAULT_THRESHOLD, Gate, gate
+from .gate import DEFAULT_THRESHOLD, REFUSAL_POLICIES, Gate, gate
 from .probes import SemanticEntropyProbe, TokenPosition
+from .refusal import (
+    DEFAULT_REFUSAL_DETECTOR,
+    CallableRefusalDetector,
+    LLMRefusalDetector,
+    NullRefusalDetector,
+    PatternRefusalDetector,
+    RefusalDetector,
+    RefusalReport,
+    detect_refusals,
+)
 from .report import Report, build_report
 from .safety import (
     DEFAULT_LIMITS,
@@ -106,6 +116,16 @@ __all__ = [
     "Gate",
     "gate",
     "DEFAULT_THRESHOLD",
+    "REFUSAL_POLICIES",
+    # refusal / abstention detection
+    "RefusalDetector",
+    "PatternRefusalDetector",
+    "LLMRefusalDetector",
+    "CallableRefusalDetector",
+    "NullRefusalDetector",
+    "RefusalReport",
+    "detect_refusals",
+    "DEFAULT_REFUSAL_DETECTOR",
     # entailment backends
     "EntailmentModel",
     "CrossEncoderEntailment",

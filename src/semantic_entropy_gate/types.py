@@ -151,6 +151,22 @@ class EntropyResult:
     cluster_assignments: List[int] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    refusal_rate: float = 0.0
+    """Share of generations that declined to answer, in ``[0, 1]``.
+
+    A separate axis from :attr:`reliable`: a unanimous refusal is a *successful*
+    measurement of a *non-answer*. See :mod:`semantic_entropy_gate.refusal`.
+    """
+
+    abstained: bool = False
+    """Every generation declined to answer.
+
+    Semantic entropy is legitimately ~0 here — the model is consistent — but it
+    is consistent about **not knowing**. Reading that zero as permission is how a
+    gate ends up authorising an irreversible action on the strength of ten
+    repetitions of "I don't know".
+    """
+
     reliable: bool = True
     """Whether this measurement is capable of detecting disagreement at all.
 
@@ -267,6 +283,16 @@ class EntropyResult:
             f"-> lexical-only component {self.lexical_entropy:.4f}"
         )
         lines.append(f"Majority-cluster agreement: {self.agreement:.1%}")
+        if self.refusal_rate:
+            lines.append(
+                f"Declined to answer: {self.refusal_rate:.0%} of generations"
+                + ("  <- ALL of them" if self.abstained else "")
+            )
+
+        if self.abstained:
+            lines.append(rule)
+            lines.append("NON-ANSWER: the model consistently declined to answer.")
+            lines.append("  Low entropy here means 'reliably no answer', not 'reliably correct'.")
 
         if not self.reliable or self.warnings:
             lines.append(rule)
@@ -295,6 +321,8 @@ class EntropyResult:
             flagged = self.is_confabulation(threshold)
             if not self.reliable:
                 verdict = "TREATED AS UNCERTAIN (measurement unreliable)"
+            elif self.abstained:
+                verdict = "NON-ANSWER (model declined; low entropy is not permission)"
             elif flagged:
                 verdict = "CONFABULATION SUSPECTED"
             else:
@@ -327,6 +355,8 @@ class EntropyResult:
             "n_samples": self.n_samples,
             "n_clusters": self.n_clusters,
             "reliable": self.reliable,
+            "refusal_rate": self.refusal_rate,
+            "abstained": self.abstained,
             "warnings": list(self.warnings),
             "metadata": dict(self.metadata),
         }
@@ -369,6 +399,8 @@ class EntropyResult:
             cluster_assignments=list(data.get("cluster_assignments", [])),
             metadata=dict(data.get("metadata", {})),
             warnings=list(data.get("warnings", [])),
+            refusal_rate=float(data.get("refusal_rate", 0.0)),
+            abstained=bool(data.get("abstained", False)),
             # Absent in v0.1.0 reports. Default to reliable so old artefacts keep
             # deserialising, but a missing flag is recorded rather than assumed.
             reliable=bool(data.get("reliable", True)),

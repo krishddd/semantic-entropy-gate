@@ -18,6 +18,7 @@ from .clustering import cluster as cluster_samples
 from .entailment import EntailmentModel, auto_entailment
 from .entropy import entropy_diagnostics, naive_string_entropy, semantic_entropy
 from .errors import SamplingError
+from .refusal import DEFAULT_REFUSAL_DETECTOR, RefusalDetector, describe
 from .safety import (
     DEFAULT_LIMITS,
     MIN_SAMPLES_FOR_ENTROPY,
@@ -49,6 +50,7 @@ def score(
     metadata: Optional[Dict[str, Any]] = None,
     limits: Limits = DEFAULT_LIMITS,
     min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
+    refusal_detector: Optional[RefusalDetector] = None,
 ) -> EntropyResult:
     """Score one prompt for semantic entropy.
 
@@ -117,6 +119,7 @@ def score(
         limits=limits,
         min_samples=min_samples,
         requested=n_samples,
+        refusal_detector=refusal_detector,
     )
 
 
@@ -133,6 +136,7 @@ def score_samples(
     limits: Limits = DEFAULT_LIMITS,
     min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
     requested: Optional[int] = None,
+    refusal_detector: Optional[RefusalDetector] = None,
 ) -> EntropyResult:
     """Score generations you already have — no sampler, no model call.
 
@@ -208,7 +212,18 @@ def score_samples(
             "reports lower entropy than the strict rule the threshold was calibrated on"
         )
 
+    # Refusals are a separate axis from integrity: the measurement worked, the
+    # model simply declined. Entropy is legitimately low for a consistent
+    # refusal, which is exactly why it needs its own flag — otherwise a gate
+    # reads "confident" and authorises an action on a non-answer.
+    detector = refusal_detector if refusal_detector is not None else DEFAULT_REFUSAL_DETECTOR
+    refusals = detector.scan(normalized)
+    refusal_note = describe(refusals)
+    if refusal_note:
+        integrity.add(refusal_note)
+
     meta = dict(metadata or {})
+    meta["refusals"] = refusals.to_dict()
     meta["clustering_seconds"] = round(elapsed_clustering, 4)
     meta["entailment_calls"] = len(outcome.judgements)
     meta["strict_entailment"] = strict
@@ -229,6 +244,8 @@ def score_samples(
         metadata=meta,
         warnings=list(integrity.warnings),
         reliable=integrity.reliable,
+        refusal_rate=refusals.rate,
+        abstained=refusals.unanimous,
     )
 
 
@@ -242,6 +259,7 @@ def score_batch(
     estimator: Optional[Estimator] = None,
     judge: Optional[Any] = None,
     on_result: Optional[Any] = None,
+    refusal_detector: Optional[RefusalDetector] = None,
 ) -> List[EntropyResult]:
     """Score many prompts, reusing one entailment backend (and therefore its cache).
 
@@ -259,6 +277,7 @@ def score_batch(
             entailment=entailment,
             strict=strict,
             estimator=estimator,
+            refusal_detector=refusal_detector,
         )
         results.append(result)
         if on_result is not None:

@@ -58,6 +58,8 @@ class Report:
             "flagged": len(flagged),
             "flag_rate": (len(flagged) / n) if threshold is not None else None,
             "unreliable": sum(1 for r in self.results if not r.reliable),
+            "abstained": sum(1 for r in self.results if r.abstained),
+            "mean_refusal_rate": sum(r.refusal_rate for r in self.results) / n,
             "with_warnings": sum(1 for r in self.results if r.warnings),
             "entailment_backends": sorted({r.entailment_backend for r in self.results}),
             "estimators": sorted({r.estimator.value for r in self.results}),
@@ -198,6 +200,7 @@ def _render_markdown(report: Report, *, top_k: int) -> str:
             f"| Flagged as confabulation | {summary['flagged']} ({summary['flag_rate']:.1%}) |"
         )
     lines.append(f"| Unreliable measurements | {summary['unreliable']} |")
+    lines.append(f"| Non-answers (model declined) | {summary['abstained']} |")
     lines.append("")
     if summary["unreliable"]:
         lines += [
@@ -294,6 +297,8 @@ def _render_result(result: EntropyResult, threshold: Optional[float]) -> List[st
     verdict = ""
     if threshold is not None:
         verdict = " — **flagged**" if result.is_confabulation(threshold) else " — within budget"
+    if result.abstained:
+        verdict = " — 🤷 **non-answer** (model declined)"
     if not result.reliable:
         verdict = " — ⛔ **measurement unreliable**"
     lines = [
