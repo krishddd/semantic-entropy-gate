@@ -32,6 +32,9 @@ from .types import EntropyResult, Estimator, Sample, normalize_texts
 
 __all__ = ["score", "score_samples", "score_batch", "DEFAULT_N_SAMPLES"]
 
+_REFUSAL_GROUP = 0
+"""Equivalence-group id used to pin refusals into one semantic cluster."""
+
 DEFAULT_N_SAMPLES = 10
 """Farquhar et al. use 10 generations; 5 is a usable budget cut, below 5 the
 discrete estimator's downward bias dominates."""
@@ -51,6 +54,7 @@ def score(
     limits: Limits = DEFAULT_LIMITS,
     min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
     refusal_detector: Optional[RefusalDetector] = None,
+    cluster_refusals: bool = True,
 ) -> EntropyResult:
     """Score one prompt for semantic entropy.
 
@@ -120,6 +124,7 @@ def score(
         min_samples=min_samples,
         requested=n_samples,
         refusal_detector=refusal_detector,
+        cluster_refusals=cluster_refusals,
     )
 
 
@@ -137,6 +142,7 @@ def score_samples(
     min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
     requested: Optional[int] = None,
     refusal_detector: Optional[RefusalDetector] = None,
+    cluster_refusals: bool = True,
 ) -> EntropyResult:
     """Score generations you already have — no sampler, no model call.
 
@@ -175,8 +181,26 @@ def score_samples(
             "Limits(max_entailment_calls=...) deliberately."
         )
 
+    # Refusals are identified before clustering, not after: they are a class the
+    # caller can recognise more reliably than any NLI oracle, and pinning them to
+    # one equivalence group is what makes the score backend-independent. Without
+    # it, ["I don't know", "Unknown", "I cannot say"] scores 0.0 under a real NLI
+    # model and 1.0 under the stdlib heuristic — the same non-answer, an entropy
+    # apart, purely on which extra the user happened to install.
+    detector = refusal_detector if refusal_detector is not None else DEFAULT_REFUSAL_DETECTOR
+    refusals = detector.scan(normalized)
+    groups: Optional[List[Optional[int]]] = None
+    if cluster_refusals and refusals.n_refusals > 1:
+        groups = [_REFUSAL_GROUP if flag else None for flag in refusals.flags]
+
     started = time.time()
-    outcome = cluster_samples(normalized, entailment, context=nli_context, strict=strict)
+    outcome = cluster_samples(
+        normalized,
+        entailment,
+        context=nli_context,
+        strict=strict,
+        equivalence_groups=groups,
+    )
     elapsed_clustering = time.time() - started
 
     entropy, probabilities, used = semantic_entropy(
@@ -216,14 +240,19 @@ def score_samples(
     # model simply declined. Entropy is legitimately low for a consistent
     # refusal, which is exactly why it needs its own flag — otherwise a gate
     # reads "confident" and authorises an action on a non-answer.
-    detector = refusal_detector if refusal_detector is not None else DEFAULT_REFUSAL_DETECTOR
-    refusals = detector.scan(normalized)
     refusal_note = describe(refusals)
     if refusal_note:
         integrity.add(refusal_note)
+    if groups is not None:
+        integrity.add(
+            f"{refusals.n_refusals} refusals were pinned to a single semantic cluster "
+            "(they all assert the same thing: no answer). This keeps the score identical "
+            "across entailment backends; set cluster_refusals=False to let the oracle decide"
+        )
 
     meta = dict(metadata or {})
     meta["refusals"] = refusals.to_dict()
+    meta["refusals_clustered"] = groups is not None
     meta["clustering_seconds"] = round(elapsed_clustering, 4)
     meta["entailment_calls"] = len(outcome.judgements)
     meta["strict_entailment"] = strict

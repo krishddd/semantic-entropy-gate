@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-21
+
+Makes the library fit for the case that actually matters: someone dropping it
+into a live agent. Two problems stood in the way, both invisible from the
+offline demo.
+
+**1. The score depended on which extra you happened to install.** A real NLI
+model merges "I don't know" with "Unknown"; the stdlib heuristic compares words
+and does not. The same four non-answers scored **0.0 on one backend and 1.0 on
+the other** — an entire entropy apart — which makes a calibrated threshold
+meaningless the moment the backend changes. Refusals are a class the library can
+identify more reliably than any oracle can, so they are now pinned to a single
+equivalence class before clustering. Both backends agree, and the result records
+that it happened (`metadata["refusals_clustered"]`, plus a warning); opt out with
+`cluster_refusals=False`.
+
+**2. Nothing stopped you shipping the triage backend to production.** It is the
+default when `[hf]` is not installed, and it looks exactly like a working
+guardrail.
+
+### Added
+
+- **Backend tiers.** Every entailment backend declares `tier`:
+  `"production"` (NLI cross-encoder, LLM judge) or `"triage"` (the stdlib
+  heuristic). The tier travels on the gate and its stats, `Gate` warns once per
+  backend, and `Gate(require_production_backend=True)` refuses to start.
+- **`preflight()` and `sem-gate doctor`** — a deployment check that *runs* rather
+  than describes. It calls your sampler, because a deterministic sampler
+  (temperature 0, a cache, a fixed seed) is the single most common way this
+  library gets deployed as a no-op, and no amount of static inspection catches
+  it. Also checks that the backend actually loads and classifies, that the
+  sampler returns what was requested, whether log-probabilities are available,
+  whether the threshold is calibrated and in range, and that the refusal
+  detector does not flag real answers. Non-zero exit when not ready, so it drops
+  into CI.
+- **`cluster_refusals`** on `score` / `score_samples`, and `equivalence_groups`
+  on `cluster()` for the general case.
+- **Calibration caveats.** `CalibrationResult.caveats` and `.trustworthy` name
+  the reasons a threshold is less trustworthy than its four decimal places
+  suggest: fewer than 30 prompts, a tiny minority class, or too few distinct
+  scores for the sweep to choose between. Rendered by `explain()` and carried in
+  the report JSON.
+- `examples/production_agent.py` — the wiring you would actually ship: enforced
+  production backend, preflight that exits non-zero, calibrated threshold,
+  fail-closed gate, and a JSON audit record per decision.
+
+### Changed
+
+- README leads with the production install and `sem-gate doctor`; the offline
+  demo is now the third thing, not the first.
+- `sem-gate doctor` is the recommended first command after install.
+
 ## [0.3.0] - 2026-07-21
 
 Closes the last finding from the v0.2.0 audit — **V7**, which was initially
@@ -174,6 +226,7 @@ First public release. Implements semantic entropy for hallucination detection
 - Zero runtime dependencies; MIT licensed; CI across Python 3.9–3.12 with lint,
   tests, an offline CLI smoke test and a clean-env wheel install check.
 
+[0.4.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.4.0
 [0.3.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.3.0
 [0.2.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.1.0

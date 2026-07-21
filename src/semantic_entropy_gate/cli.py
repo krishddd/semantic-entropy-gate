@@ -33,6 +33,7 @@ from .entailment import (
 )
 from .errors import SemanticEntropyError
 from .gate import DEFAULT_THRESHOLD, Gate
+from .preflight import preflight
 from .report import Report, build_report
 from .sampling import from_texts, resolve_sampler
 from .score import DEFAULT_N_SAMPLES, score, score_samples
@@ -437,6 +438,28 @@ def cmd_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Check whether this deployment is actually fit to gate production traffic."""
+    sampler = _load_entrypoint(args.sampler) if args.sampler else None
+    judge = _load_entrypoint(args.judge) if args.judge else None
+    entailment = _build_entailment(args) if args.entailment != "auto" else None
+    report = preflight(
+        sampler=sampler,
+        entailment=entailment,
+        judge=judge,
+        threshold=args.threshold,
+        calibrated=args.calibrated,
+        n_samples=args.n_samples,
+        probe_prompt=args.prompt,
+        require_production_backend=not args.allow_triage,
+    )
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(report.render())
+    return 0 if report.ready else 1
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     """Gate a single prompt from the command line."""
     entailment = _build_entailment(args)
@@ -552,6 +575,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("--block-threshold", type=float)
     _add_scoring_args(p_gate)
     p_gate.set_defaults(func=cmd_gate)
+
+    p_doctor = sub.add_parser(
+        "doctor", help="check whether this setup is fit to gate production traffic"
+    )
+    p_doctor.add_argument("--threshold", type=float, help="the threshold you intend to deploy")
+    p_doctor.add_argument(
+        "--calibrated", action="store_true", help="the threshold came from `sem-gate calibrate`"
+    )
+    p_doctor.add_argument(
+        "--allow-triage", action="store_true", help="do not fail on a triage-tier backend"
+    )
+    p_doctor.add_argument(
+        "--prompt",
+        default="In one sentence, what is the capital of France?",
+        help="prompt used to probe the sampler",
+    )
+    p_doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    _add_scoring_args(p_doctor)
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_demo = sub.add_parser("demo", help="run the full pipeline on canned data (offline)")
     p_demo.add_argument("--out", help="also write <out>.json and <out>.md")

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "semantic-entropy-gate"
-version = "0.3.0"
+version = "0.4.0"
 description = "Detect LLM confabulation with semantic entropy (Farquhar et al., Nature 2024) and gate agent actions on it."
 readme = "README.md"
 license = { text = "MIT" }

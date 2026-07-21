@@ -503,7 +503,15 @@ class CalibrationResult:
     operating_point: ThresholdPoint
     curve: List[ThresholdPoint] = field(default_factory=list)
     base_rate: float = 0.0
+    caveats: List[str] = field(default_factory=list)
+    """Reasons this threshold is less trustworthy than its decimals suggest."""
+
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def trustworthy(self) -> bool:
+        """No caveats and better-than-chance separation."""
+        return not self.caveats and self.auroc >= 0.65
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -515,6 +523,8 @@ class CalibrationResult:
             "n_positive": self.n_positive,
             "n_negative": self.n_negative,
             "base_rate": self.base_rate,
+            "caveats": list(self.caveats),
+            "trustworthy": self.trustworthy,
             "operating_point": self.operating_point.to_dict(),
             "curve": [p.to_dict() for p in self.curve],
             "metadata": dict(self.metadata),
@@ -540,8 +550,13 @@ class CalibrationResult:
                 f"  TPR (catch rate)  {op.tpr:.3f}      FPR (false alarms) {op.fpr:.3f}",
                 f"  precision {op.precision:.3f}  recall {op.recall:.3f}  "
                 f"F1 {op.f1:.3f}  accuracy {op.accuracy:.3f}",
-                bar,
             ]
+            + (
+                ["-" * width, "CAVEATS"] + [f"  - {c}" for c in self.caveats]
+                if self.caveats
+                else []
+            )
+            + [bar]
         )
 
 

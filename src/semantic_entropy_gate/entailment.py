@@ -31,6 +31,7 @@ from .types import EntailmentLabel
 
 __all__ = [
     "EntailmentModel",
+    "TIERS",
     "CrossEncoderEntailment",
     "LLMJudgeEntailment",
     "LexicalEntailment",
@@ -40,6 +41,16 @@ __all__ = [
     "DEFAULT_CROSS_ENCODER",
     "SMALL_CROSS_ENCODER",
 ]
+
+TIERS = ("production", "triage")
+"""Fidelity tiers for an entailment backend.
+
+``production`` — a real NLI model, or an LLM judge. Fit to gate live traffic.
+``triage``     — the stdlib heuristic. Deterministic, offline and instant, but it
+                 compares words rather than meanings. Fine for tests, CI and a
+                 first look; **not** something to put in front of an irreversible
+                 action.
+"""
 
 DEFAULT_CROSS_ENCODER = "microsoft/deberta-large-mnli"
 """The model used in the original paper. ~1.6 GB; best fidelity."""
@@ -55,6 +66,12 @@ _Verdict = Tuple[EntailmentLabel, Optional[float]]
 class EntailmentModel(ABC):
     """Directional NLI oracle.
 
+    ``tier`` declares whether this backend is fit to gate production traffic.
+    Every score is only as trustworthy as the oracle underneath it, so the tier
+    travels on the result and :class:`~semantic_entropy_gate.gate.Gate` can be
+    told to refuse anything below ``"production"``.
+
+
     Implementations answer a single question: reading ``premise``, would a careful
     reader conclude ``hypothesis`` follows? Clustering calls this twice per pair
     (A->B and B->A) because semantic equivalence is the *conjunction* of both
@@ -62,6 +79,8 @@ class EntailmentModel(ABC):
     """
 
     name: str = "entailment"
+    tier: str = "production"
+    """``"production"`` or ``"triage"``. See :data:`TIERS`."""
 
     @abstractmethod
     def classify(
@@ -400,6 +419,7 @@ class LexicalEntailment(EntailmentModel):
     """
 
     name = "lexical-heuristic"
+    tier = "triage"
 
     def __init__(self, *, coverage_threshold: float = 0.5) -> None:
         self.coverage_threshold = coverage_threshold
@@ -466,6 +486,7 @@ class CannedEntailment(EntailmentModel):
     """
 
     name = "canned"
+    tier = "triage"
 
     def __init__(
         self,
@@ -508,6 +529,7 @@ class CachedEntailment(EntailmentModel):
     def __init__(self, inner: EntailmentModel, *, maxsize: int = 20000) -> None:
         self.inner = inner
         self.name = f"cached({inner.name})"
+        self.tier = inner.tier
         self.maxsize = maxsize
         self._cache: Dict[Tuple[str, str, str], Tuple[EntailmentLabel, Optional[float]]] = {}
         self.hits = 0

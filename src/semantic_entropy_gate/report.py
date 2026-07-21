@@ -116,6 +116,7 @@ class Report:
                 operating_point=ThresholdPoint(**raw_cal["operating_point"]),
                 curve=[ThresholdPoint(**p) for p in raw_cal.get("curve", [])],
                 base_rate=raw_cal.get("base_rate", 0.0),
+                caveats=list(raw_cal.get("caveats", [])),
                 metadata=raw_cal.get("metadata", {}),
             )
         return cls(

@@ -37,6 +37,10 @@ __all__ = [
 
 Scored = Union[EntropyResult, float, int]
 
+SMALL_DEV_SET = 30
+"""Below this many labelled prompts, a fitted threshold is a number rather than a
+measurement. Calibration still runs, but says so."""
+
 CRITERIA = ("youden", "f1", "target_fpr", "target_recall", "accuracy")
 """Selection rules understood by :func:`calibrate`."""
 
@@ -124,6 +128,26 @@ def calibrate(
     curve = threshold_sweep(scores, ys)
     point = _select(curve, criterion, target_fpr=target_fpr, target_recall=target_recall)
 
+    # A threshold fitted to a handful of prompts is a number, not a measurement.
+    # It will look authoritative in a report, so the report has to say otherwise.
+    caveats: List[str] = []
+    if len(ys) < SMALL_DEV_SET:
+        caveats.append(
+            f"fitted on only {len(ys)} prompts (recommended >= {SMALL_DEV_SET}): this "
+            "threshold and its AUROC are both high-variance, and a rerun on different "
+            "prompts may move them substantially"
+        )
+    if min(n_pos, n_neg) < 5:
+        caveats.append(
+            f"the smaller class has {min(n_pos, n_neg)} example(s); metrics conditioned "
+            "on it (precision, recall) are essentially unmeasured"
+        )
+    if len(set(scores)) < 3:
+        caveats.append(
+            f"the dev set contains only {len(set(scores))} distinct score(s), so the "
+            "threshold sweep had almost nothing to choose between"
+        )
+
     return CalibrationResult(
         threshold=point.threshold,
         auroc=auroc(scores, ys),
@@ -135,6 +159,7 @@ def calibrate(
         operating_point=point,
         curve=curve,
         base_rate=n_pos / len(ys),
+        caveats=caveats,
         metadata={
             "normalized": normalized,
             "target_fpr": target_fpr,

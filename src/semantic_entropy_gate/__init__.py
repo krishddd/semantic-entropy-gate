@@ -30,7 +30,7 @@ models using semantic entropy*, Nature 630 (2024).
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .active_inference import (
     Policy,
@@ -44,6 +44,7 @@ from .calibrate import auprc, auroc, calibrate, roc_curve, threshold_sweep
 from .clustering import cluster
 from .dataset import DatasetRow, load_dataset, write_jsonl
 from .entailment import (
+    TIERS,
     CachedEntailment,
     CannedEntailment,
     CrossEncoderEntailment,
@@ -67,6 +68,7 @@ from .errors import (
     SemanticEntropyError,
 )
 from .gate import DEFAULT_THRESHOLD, REFUSAL_POLICIES, Gate, gate
+from .preflight import Check, PreflightReport, preflight
 from .probes import SemanticEntropyProbe, TokenPosition
 from .refusal import (
     DEFAULT_REFUSAL_DETECTOR,
@@ -134,6 +136,11 @@ __all__ = [
     "CannedEntailment",
     "CachedEntailment",
     "auto_entailment",
+    "TIERS",
+    # deployment preflight
+    "preflight",
+    "PreflightReport",
+    "Check",
     # samplers
     "resolve_sampler",
     "from_texts",

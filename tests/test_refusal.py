@@ -326,15 +326,67 @@ def test_refusal_policy_allow_restores_the_old_behaviour():
     assert "declined" in decision.warning
 
 
-def test_varied_refusals_also_defer_on_entropy_grounds():
-    """Defence in depth: refusals phrased differently look like disagreement too.
+VARIED_REFUSALS = ["I don't know.", "Unknown.", "I'm not sure.", "I cannot answer that."]
 
-    Whether that happens depends on the entailment oracle — a real NLI model
-    merges "I don't know" with "Unknown", the lexical heuristic does not. The
-    abstention flag is what makes the outcome the same either way.
+
+def test_refusals_score_identically_on_every_backend():
+    """The score must not depend on which extra the user happened to install.
+
+    A real NLI model merges "I don't know" with "Unknown"; the stdlib heuristic
+    compares words and does not. Left to the oracle, the same four non-answers
+    score 0.0 on one backend and 1.0 on the other — an entire entropy apart —
+    which makes a calibrated threshold meaningless the moment the backend
+    changes. Refusals are pinned to one equivalence class so both agree.
     """
-    gate = Gate(None, threshold=0.55, entailment=LexicalEntailment(), refusal_policy="allow")
-    assert gate.check_samples("q", REFUSALS[:4]).allowed is False
+    from semantic_entropy_gate import CannedEntailment
+    from semantic_entropy_gate.types import EntailmentLabel
+
+    nli_like = CannedEntailment(default=EntailmentLabel.ENTAILMENT)  # merges everything
+    heuristic = LexicalEntailment()  # merges almost nothing
+
+    a = score_samples("q", VARIED_REFUSALS, entailment=nli_like)
+    b = score_samples("q", VARIED_REFUSALS, entailment=heuristic)
+
+    assert a.normalized_entropy == b.normalized_entropy == 0.0
+    assert a.n_clusters == b.n_clusters == 1
+    assert a.abstained is b.abstained is True
+
+
+def test_refusal_clustering_is_recorded_not_silent():
+    result = score_samples("q", VARIED_REFUSALS, entailment=LexicalEntailment())
+    assert result.metadata["refusals_clustered"] is True
+    assert any("pinned to a single semantic cluster" in w for w in result.warnings)
+
+
+def test_refusal_clustering_can_be_disabled():
+    result = score_samples(
+        "q", VARIED_REFUSALS, entailment=LexicalEntailment(), cluster_refusals=False
+    )
+    assert result.metadata["refusals_clustered"] is False
+    assert result.n_clusters > 1  # back to the oracle's opinion
+    assert result.abstained is True  # the flag still catches it
+
+
+def test_pinning_refusals_does_not_merge_real_answers():
+    """Only refusals are pinned; genuine disagreement must survive untouched."""
+    result = score_samples(
+        "q",
+        ["I don't know.", "Unknown.", "Paris.", "Lyon."],
+        entailment=LexicalEntailment(),
+    )
+    assignments = result.cluster_assignments
+    assert assignments[0] == assignments[1]  # the two refusals merged
+    assert assignments[2] != assignments[3]  # Paris and Lyon did NOT
+    assert assignments[2] != assignments[0]  # nor did an answer join the refusals
+
+
+def test_a_single_refusal_is_not_pinned():
+    # Nothing to merge it with; pinning would only add a spurious warning.
+    result = score_samples(
+        "q", ["I don't know.", "Paris.", "Lyon."], entailment=LexicalEntailment()
+    )
+    assert result.metadata["refusals_clustered"] is False
+    assert result.n_clusters == 3
 
 
 def test_the_defer_hook_fires_on_a_refusal():

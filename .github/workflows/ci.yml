@@ -70,6 +70,15 @@ jobs:
           python examples/gate_an_agent.py
           python examples/calibrate_threshold.py
           python examples/refusal_aware_gate.py
+          python examples/production_agent.py
+      - name: sem-gate doctor rejects a triage backend (exit code 1)
+        run: |
+          set +e
+          sem-gate doctor --entailment lexical --threshold 0.55
+          code=$?
+          set -e
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          echo "doctor correctly refused to certify the triage backend"
       - name: A non-answer must not open the gate (exit code 2 == not allowed)
         run: |
           set +e

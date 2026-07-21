@@ -67,28 +67,63 @@ Token-level uncertainty cannot tell those apart: *"It is in Paris"* and *"Paris,
 
 ## Install
 
+**Putting this in front of a real agent?** Install the NLI backend:
+
 ```bash
-pip install semantic-entropy-gate
+pip install "semantic-entropy-gate[hf]"
 ```
 
-That is the whole install. The core library has **no dependencies**.
+Semantic entropy is only as good as its *equivalence oracle* — the thing that decides whether two answers mean the same thing. `[hf]` gives you a real NLI cross-encoder (~70 MB, CPU-fast). Without it the library falls back to a stdlib word-overlap heuristic that is fine for tests and a first look, and **not** something to put in front of an irreversible action. It says so, loudly, at every level:
 
-Optional extras, only if you want them:
+```python
+Gate(sampler)                                   # UserWarning: backend tier 'triage'
+Gate(sampler, require_production_backend=True)  # ValueError — refuses to start
+```
+
+No GPU and no local model? Use any chat model as the oracle instead — same tier, no download:
+
+```python
+Gate(sampler, judge=my_chat_callable)
+```
+
+Other install shapes:
 
 ```bash
-pip install "semantic-entropy-gate[hf]"      # local NLI cross-encoder (best fidelity)
-pip install "semantic-entropy-gate[openai]"  # OpenAI-compatible sampler helper
+pip install semantic-entropy-gate             # core only, zero dependencies
+pip install "semantic-entropy-gate[openai]"   # + OpenAI-compatible sampler helper
 ```
 
 Requires Python 3.9+.
 
-### See it work in 10 seconds
+### Check your setup before you trust it
+
+Installing the package is not the same as deploying it correctly — and **every way of deploying it incorrectly produces a reassuringly low entropy**. So the failure you are most likely to ship is a gate that looks like it is working. One command tells you:
 
 ```bash
-sem-gate demo
+sem-gate doctor --sampler myproject.llm:sample --threshold 0.62 --calibrated
 ```
 
-No network, no API key, no model download. It scores four canned prompts, calibrates a threshold, gates an action and prints the full reasoning — the same output you would get in production.
+```
+[PASS] entailment backend     cross-encoder:cross-encoder/nli-deberta-v3-xsmall (production)
+[PASS] backend loads          3 test pairs classified in 0.41s
+[PASS] sampler callable       sample
+[FAIL] sampler diversity      10 draws produced 1 distinct string
+       -> Your sampler looks deterministic (temperature 0, a cache in front of
+          it, or a fixed seed). Semantic entropy over identical samples is 0
+          regardless of correctness, so the gate would allow everything. Set
+          temperature to ~1.0 and make sure each draw is independent.
+[PASS] threshold              0.6200 (calibrated)
+------------------------------------------------------------------------------
+NOT READY: 1 failure(s), 0 warning(s). Fix the failures before gating anything.
+```
+
+It **calls your sampler** — that is the only way to catch a deterministic one, and a deterministic sampler is the single most common way this library gets deployed as a no-op. Exit code is non-zero when not ready, so it drops straight into CI. Available as `preflight()` from Python too.
+
+### Or just watch it work, offline
+
+```bash
+sem-gate demo    # no network, no API key, no model download
+```
 
 ---
 
@@ -457,13 +492,23 @@ AUROC is computed by the exact Mann–Whitney rank-sum identity with mid-rank ti
 
 The score is only as good as the equivalence oracle, so the chosen backend is stamped on every result.
 
-| Backend | Needs | Notes |
-| --- | --- | --- |
-| `CrossEncoderEntailment` | `[hf]` extra | The paper's approach. Default checkpoint `cross-encoder/nli-deberta-v3-xsmall` (~70 MB, CPU-fast); pass `microsoft/deberta-large-mnli` for full fidelity. |
-| `LLMJudgeEntailment` | any chat callable | For no-GPU users. Zero-temperature judge; unparseable replies fall back to `neutral`, which errs toward reporting *more* uncertainty — the safe direction for a guardrail. |
-| `LexicalEntailment` | nothing | Stdlib heuristic: conflicting numbers → contradiction, negation mismatch → contradiction, content coverage → entailment. **Triage grade.** Exact on the "different concrete facts" failure mode, which is what confabulation usually looks like. Powers the demo and the test suite. |
+| Backend | Tier | Needs | Notes |
+| --- | --- | --- | --- |
+| `CrossEncoderEntailment` | **production** | `[hf]` extra | The paper's approach. Default checkpoint `cross-encoder/nli-deberta-v3-xsmall` (~70 MB, CPU-fast); pass `microsoft/deberta-large-mnli` for full fidelity. |
+| `LLMJudgeEntailment` | **production** | any chat callable | For no-GPU users. Zero-temperature judge; unparseable replies fall back to `neutral`, which errs toward reporting *more* uncertainty — the safe direction for a guardrail. |
+| `LexicalEntailment` | triage | nothing | Stdlib heuristic: conflicting numbers → contradiction, negation mismatch → contradiction, content coverage → entailment. Exact on the "different concrete facts" failure mode, and useless on paraphrase. Powers the demo and the test suite. |
 
-`auto_entailment()` picks the best available and emits a `UserWarning` if it falls all the way back to the heuristic — you should never be unaware of which oracle produced a number.
+The tier travels with the score (`result.entailment_backend`, `gate.backend_tier`, `gate.stats()`), `auto_entailment()` warns when it falls back, and `Gate(require_production_backend=True)` refuses to start on a triage backend. You should never be unaware of which oracle produced a number.
+
+**Scores from different backends are not comparable, and the library removes the worst of that variance itself.** Refusals are the clearest case: a real NLI model merges *"I don't know"* with *"Unknown"*, the heuristic does not, so the same four non-answers would score `0.0` on one backend and `1.0` on the other — an entire entropy apart, purely on which extra you installed. Since a refusal set is something the library can identify more reliably than any oracle can, refusals are pinned to one equivalence class before clustering, and the result records that it happened:
+
+```python
+result.metadata["refusals_clustered"]   # True
+result.warnings                          # ['... pinned to a single semantic cluster ...']
+score_samples(..., cluster_refusals=False)  # opt out, let the oracle decide
+```
+
+Everything else still needs recalibration when you change backend.
 
 ### Cost, honestly
 

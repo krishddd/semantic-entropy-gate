@@ -62,6 +62,7 @@ def cluster(
     context: str = "",
     strict: bool = True,
     exact_match_shortcut: bool = True,
+    equivalence_groups: Optional[Sequence[Optional[int]]] = None,
 ) -> ClusterOutcome:
     """Partition ``samples`` into semantic equivalence classes.
 
@@ -82,6 +83,20 @@ def cluster(
     exact_match_shortcut:
         Skip the NLI call for byte-identical generations. Pure saving, no
         behaviour change — identical strings are trivially equivalent.
+    equivalence_groups:
+        Optional per-sample group id. Samples sharing a non-``None`` id are
+        treated as known-equivalent: they land in one cluster without consulting
+        the oracle, and are never compared against each other.
+
+        This exists for classes the caller can identify more reliably than an
+        NLI model can — in practice, **refusals**. "I don't know", "Unknown" and
+        "I cannot answer that" assert the same thing (nothing), but whether a
+        given backend merges them varies wildly: a real NLI model does, the
+        stdlib heuristic does not. Left to the oracle, the same sample set scores
+        0.0 on one backend and 1.0 on another, which makes a calibrated threshold
+        meaningless the moment the backend changes. Pinning the group removes
+        that variance instead of hiding it — and the caller records that it did
+        so.
 
     Returns
     -------
@@ -94,6 +109,11 @@ def cluster(
     assignments: List[int] = [-1] * n
     judgements: List[EntailmentJudgement] = []
     clusters: List[SemanticCluster] = []
+    groups: Sequence[Optional[int]] = (
+        equivalence_groups if equivalence_groups is not None else [None] * n
+    )
+    if len(groups) != n:
+        raise ValueError(f"equivalence_groups has {len(groups)} entries for {n} samples")
 
     for i in range(n):
         if assignments[i] != -1:
@@ -104,6 +124,16 @@ def cluster(
 
         for j in range(i + 1, n):
             if assignments[j] != -1:
+                continue
+            if groups[i] is not None and groups[j] == groups[i]:
+                # Known-equivalent by construction; no oracle call needed.
+                assignments[j] = cluster_id
+                member_indices.append(j)
+                continue
+            if groups[i] is not None or groups[j] is not None:
+                # One side is in a pinned group and the other is not (or is in a
+                # different one). They are not equivalent, and asking the oracle
+                # could only override a fact the caller already established.
                 continue
             if exact_match_shortcut and samples[i].text.strip() == samples[j].text.strip():
                 assignments[j] = cluster_id

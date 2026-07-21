@@ -49,6 +49,10 @@ reading the (legitimately low) entropy as permission; the abstention still
 travels on the decision as a warning.
 """
 
+_WARNED_BACKENDS: set = set()
+"""Backends already warned about, so a server building a gate per request does
+not fill its logs with the same line."""
+
 DEFAULT_THRESHOLD = 0.55
 """Uncalibrated default on the *normalised* entropy scale.
 
@@ -112,6 +116,7 @@ class Gate:
         min_samples: int = MIN_SAMPLES_FOR_ENTROPY,
         refusal_policy: str = "defer",
         refusal_detector: Optional[RefusalDetector] = None,
+        require_production_backend: bool = False,
     ) -> None:
         config_warnings = validate_threshold(threshold, normalized=normalized)
         if warn_threshold is None:
@@ -154,6 +159,26 @@ class Gate:
         self.min_samples = min_samples
         self.refusal_policy = refusal_policy
         self.refusal_detector = refusal_detector
+
+        # The score is only as trustworthy as the oracle underneath it. Shipping
+        # the stdlib heuristic in front of an irreversible action is a mistake
+        # that looks exactly like a working guardrail, so say so out loud.
+        self.backend_tier = getattr(self.entailment, "tier", "production")
+        if self.backend_tier != "production":
+            message = (
+                f"entailment backend {self.entailment.name!r} is tier "
+                f"{self.backend_tier!r}: it compares words, not meanings, and is "
+                "intended for tests and a first look rather than production "
+                'traffic. Install a real NLI model (pip install "semantic-entropy-'
+                'gate[hf]") or pass judge=<chat callable>.'
+            )
+            if require_production_backend:
+                raise ValueError(message)
+            config_warnings = list(config_warnings) + [message]
+            if self.entailment.name not in _WARNED_BACKENDS:
+                _WARNED_BACKENDS.add(self.entailment.name)
+                warnings.warn(message, UserWarning, stacklevel=2)
+        self.require_production_backend = require_production_backend
         self.config_warnings = config_warnings
         self.history: List[GateDecision] = []
 
@@ -465,6 +490,7 @@ class Gate:
             "warn_threshold": self.warn_threshold,
             "block_threshold": self.block_threshold,
             "entailment_backend": self.entailment.name,
+            "backend_tier": self.backend_tier,
             "abstentions": sum(1 for d in self.history if d.result.abstained),
             "unreliable": sum(1 for d in self.history if not d.result.reliable),
         }
