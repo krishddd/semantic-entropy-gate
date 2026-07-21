@@ -29,6 +29,8 @@ from .types import CalibrationResult, EntropyResult, ThresholdPoint
 __all__ = [
     "calibrate",
     "auroc",
+    "auroc_ci",
+    "required_dev_set_size",
     "auprc",
     "roc_curve",
     "threshold_sweep",
@@ -78,6 +80,7 @@ def calibrate(
     target_fpr: float = 0.1,
     target_recall: float = 0.8,
     normalized: bool = True,
+    confidence: float = 0.95,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> CalibrationResult:
     """Pick a decision threshold from a labelled dev set.
@@ -127,10 +130,24 @@ def calibrate(
 
     curve = threshold_sweep(scores, ys)
     point = _select(curve, criterion, target_fpr=target_fpr, target_recall=target_recall)
+    auc, lower, upper = auroc_ci(scores, ys, confidence=confidence)
 
     # A threshold fitted to a handful of prompts is a number, not a measurement.
     # It will look authoritative in a report, so the report has to say otherwise.
     caveats: List[str] = []
+    if lower <= 0.5:
+        needed = required_dev_set_size(auc, confidence=confidence, positive_rate=n_pos / len(ys))
+        extra = (
+            f" About {needed} labelled prompts would settle it at this effect size."
+            if needed
+            else " At this effect size no realistic dev set would settle it, which is "
+            "itself the answer: the signal is not there."
+        )
+        caveats.append(
+            f"the {int(confidence * 100)}% confidence interval for AUROC "
+            f"[{lower:.3f}, {upper:.3f}] includes 0.5, so this dev set does NOT "
+            "establish that semantic entropy separates hallucinations on your task." + extra
+        )
     if len(ys) < SMALL_DEV_SET:
         caveats.append(
             f"fitted on only {len(ys)} prompts (recommended >= {SMALL_DEV_SET}): this "
@@ -150,7 +167,10 @@ def calibrate(
 
     return CalibrationResult(
         threshold=point.threshold,
-        auroc=auroc(scores, ys),
+        auroc=auc,
+        auroc_lower=lower,
+        auroc_upper=upper,
+        confidence=confidence,
         auprc=auprc(scores, ys),
         criterion=criterion,
         n_samples=len(ys),
@@ -197,6 +217,98 @@ def auroc(scores: Sequence[float], labels: Sequence[int]) -> float:
     rank_sum_pos = sum(r for r, y in zip(ranks, labels) if y == 1)
     u = rank_sum_pos - n_pos * (n_pos + 1) / 2.0
     return u / (n_pos * n_neg)
+
+
+Z_FOR_CONFIDENCE = {0.80: 1.2816, 0.90: 1.6449, 0.95: 1.9600, 0.99: 2.5758}
+"""Two-sided normal quantiles, so no scipy dependency is needed."""
+
+
+def auroc_ci(
+    scores: Sequence[float], labels: Sequence[int], *, confidence: float = 0.95
+) -> Tuple[float, float, float]:
+    """AUROC with a confidence interval: ``(auc, lower, upper)``.
+
+    **Why this matters more than the point estimate.** An AUROC of 0.78 measured
+    on 30 prompts and one measured on 300 are not the same claim, but they print
+    identically. Reporting the point estimate alone is exactly the overconfidence
+    this library exists to detect — applied to the library's own output.
+
+    If the interval includes 0.5 you have not established that semantic entropy
+    separates hallucinations on your task *at all*, however good the number
+    looks. Deploying on that basis is guessing with extra steps.
+
+    Uses the Hanley & McNeil (1982) closed form: with ``A`` the AUC,
+
+        Q1 = A / (2 - A),  Q2 = 2A^2 / (1 + A)
+        SE = sqrt( [A(1-A) + (n_pos-1)(Q1 - A^2) + (n_neg-1)(Q2 - A^2)] / (n_pos * n_neg) )
+
+    It is the standard analytic estimator, needs no resampling (so it is exactly
+    reproducible), and is mildly conservative — it assumes exponential score
+    distributions, which real entropy scores are not. Treat the interval as
+    indicative, not exact; the conclusion you should draw from it ("is the lower
+    bound above 0.5?") is robust to that approximation.
+    """
+    if confidence not in Z_FOR_CONFIDENCE:
+        raise CalibrationError(
+            f"confidence must be one of {sorted(Z_FOR_CONFIDENCE)}, got {confidence}"
+        )
+    a = auroc(scores, labels)
+    n_pos = sum(labels)
+    n_neg = len(labels) - n_pos
+
+    # Continuity correction for the degenerate ends. At an observed AUC of
+    # exactly 1.0 (common on small dev sets) the Hanley-McNeil variance is 0 and
+    # the interval collapses to [1.0, 1.0] — "perfect separation, established
+    # with certainty, from 12 prompts". That is precisely the overconfidence
+    # this library exists to flag, so the variance is computed as if half a
+    # discordant pair had been observed: the least separation the data could
+    # still be hiding.
+    pairs = n_pos * n_neg
+    a_var = min(max(a, 0.5 / pairs), 1.0 - 0.5 / pairs)
+
+    q1 = a_var / (2.0 - a_var)
+    q2 = (2.0 * a_var * a_var) / (1.0 + a_var)
+    numerator = (
+        a_var * (1.0 - a_var)
+        + (n_pos - 1) * (q1 - a_var * a_var)
+        + (n_neg - 1) * (q2 - a_var * a_var)
+    )
+    variance = max(0.0, numerator) / pairs
+    se = math.sqrt(variance)
+    z = Z_FOR_CONFIDENCE[confidence]
+    return a, max(0.0, a - z * se), min(1.0, a + z * se)
+
+
+def required_dev_set_size(
+    observed_auroc: float,
+    *,
+    confidence: float = 0.95,
+    positive_rate: float = 0.5,
+    max_n: int = 5000,
+) -> Optional[int]:
+    """Roughly how many labelled prompts would establish this AUROC as real.
+
+    Answers the question a deployer actually asks when told "your interval
+    includes 0.5": *how many more labels do I need?* Returns the smallest total
+    dev-set size whose lower confidence bound clears 0.5 at the observed effect
+    size, or ``None`` if no size within ``max_n`` would (i.e. the effect is too
+    small to be worth chasing — the signal is not there).
+    """
+    if observed_auroc <= 0.5:
+        return None
+    a = observed_auroc
+    q1 = a / (2.0 - a)
+    q2 = (2.0 * a * a) / (1.0 + a)
+    z = Z_FOR_CONFIDENCE[confidence]
+
+    for n in range(10, max_n + 1, 2):
+        n_pos = max(1, int(round(n * positive_rate)))
+        n_neg = max(1, n - n_pos)
+        numerator = a * (1 - a) + (n_pos - 1) * (q1 - a * a) + (n_neg - 1) * (q2 - a * a)
+        se = math.sqrt(max(0.0, numerator) / (n_pos * n_neg))
+        if a - z * se > 0.5:
+            return n
+    return None
 
 
 def _mid_ranks(values: Sequence[float]) -> List[float]:

@@ -108,6 +108,9 @@ class Report:
             calibration = CalibrationResult(
                 threshold=raw_cal["threshold"],
                 auroc=raw_cal["auroc"],
+                auroc_lower=raw_cal.get("auroc_lower", raw_cal["auroc"]),
+                auroc_upper=raw_cal.get("auroc_upper", raw_cal["auroc"]),
+                confidence=raw_cal.get("confidence", 0.95),
                 auprc=raw_cal.get("auprc", 0.0),
                 criterion=raw_cal.get("criterion", "youden"),
                 n_samples=raw_cal.get("n_samples", 0),

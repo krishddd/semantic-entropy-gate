@@ -30,7 +30,7 @@ models using semantic entropy*, Nature 630 (2024).
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .active_inference import (
     Policy,
@@ -40,7 +40,15 @@ from .active_inference import (
     rank_policies,
     should_forage,
 )
-from .calibrate import auprc, auroc, calibrate, roc_curve, threshold_sweep
+from .calibrate import (
+    auprc,
+    auroc,
+    auroc_ci,
+    calibrate,
+    required_dev_set_size,
+    roc_curve,
+    threshold_sweep,
+)
 from .clustering import cluster
 from .dataset import DatasetRow, load_dataset, write_jsonl
 from .entailment import (
@@ -154,6 +162,8 @@ __all__ = [
     # calibration
     "calibrate",
     "auroc",
+    "auroc_ci",
+    "required_dev_set_size",
     "auprc",
     "roc_curve",
     "threshold_sweep",

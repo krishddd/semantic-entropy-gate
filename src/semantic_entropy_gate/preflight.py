@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .entailment import EntailmentModel, auto_entailment
 from .refusal import DEFAULT_REFUSAL_DETECTOR, RefusalDetector
@@ -71,6 +71,10 @@ class PreflightReport:
     """All checks, plus the single question a deployer cares about."""
 
     checks: List[Check] = field(default_factory=list)
+    calibration: Optional[Any] = None
+    """The fitted :class:`~semantic_entropy_gate.types.CalibrationResult` when a
+    labelled dev set was supplied — so `doctor` hands you the threshold to
+    deploy in the same breath as the verdict."""
 
     @property
     def failures(self) -> List[Check]:
@@ -96,6 +100,7 @@ class PreflightReport:
             "n_failures": len(self.failures),
             "n_warnings": len(self.warnings),
             "checks": [c.to_dict() for c in self.checks],
+            "calibration": self.calibration.to_dict() if self.calibration else None,
         }
 
     def render(self, width: int = 78) -> str:
@@ -133,6 +138,8 @@ def preflight(
     probe_prompt: str = "In one sentence, what is the capital of France?",
     refusal_detector: Optional[RefusalDetector] = None,
     require_production_backend: bool = True,
+    dev_set: Optional[Sequence[Any]] = None,
+    confidence: float = 0.95,
 ) -> PreflightReport:
     """Run every deployment check and report whether this setup is safe to ship.
 
@@ -149,6 +156,15 @@ def preflight(
         uncalibrated default.
     require_production_backend:
         Treat a ``triage``-tier backend as a failure rather than a warning.
+    dev_set:
+        Labelled prompts from **your task** (:class:`~semantic_entropy_gate.dataset.DatasetRow`,
+        or anything with ``.prompt`` / ``.samples`` / ``.label``). This unlocks
+        the one check none of the others can substitute for: whether semantic
+        entropy actually separates hallucinations on your task, reported as an
+        AUROC **with a confidence interval**. Rows carrying generations are
+        scored offline; prompt-only rows need ``sampler``. Without it, the
+        report carries an explicit SKIP naming this as the biggest remaining
+        unknown — a wall of PASSes must not imply a validation that never ran.
     """
     report = PreflightReport()
     backend = _check_backend(report, entailment, judge, require_production_backend)
@@ -156,8 +172,170 @@ def preflight(
     _check_sampler(report, sampler, n_samples, probe_prompt)
     _check_threshold(report, threshold, calibrated)
     _check_refusal_detector(report, refusal_detector)
+    report.calibration = _check_task_separation(
+        report, dev_set, backend, sampler, n_samples, confidence
+    )
     report.checks.sort(key=lambda c: _ORDER[c.status])
     return report
+
+
+def _check_task_separation(
+    report: PreflightReport,
+    dev_set: Optional[Sequence[Any]],
+    backend: EntailmentModel,
+    sampler: Optional[Callable[..., Any]],
+    n_samples: int,
+    confidence: float,
+) -> Optional[Any]:
+    """The only check that answers the question that actually matters.
+
+    Everything else here verifies that the *machinery* works. This one asks
+    whether semantic entropy separates hallucinations **on your task** — and
+    that cannot be answered by inspection, by a clever heuristic, or by trusting
+    the paper's numbers. It needs prompts from your own domain, labelled with
+    whether the model was actually right.
+
+    So when no labelled data is supplied the check reports SKIP with the biggest
+    remaining unknown stated plainly, rather than letting a wall of PASSes imply
+    a validation that never happened.
+    """
+    from .calibrate import calibrate
+    from .errors import CalibrationError
+    from .score import score, score_samples
+
+    if not dev_set:
+        report.add(
+            "task separation",
+            SKIP,
+            "no labelled dev set supplied",
+            "THIS IS THE BIGGEST REMAINING UNKNOWN. Every other check above "
+            "verifies that the machinery runs; none of them can tell you whether "
+            "semantic entropy actually separates hallucinations on YOUR task. "
+            "Only labelled data answers that. Build a dev set with "
+            "`sem-gate label`, then re-run with --dev-set. ~100 prompts is "
+            "usually enough; 30 is the minimum worth reporting.",
+        )
+        return None
+
+    results, labels = [], []
+    for row in dev_set:
+        label = getattr(row, "label", None)
+        if label is None:
+            continue
+        try:
+            if getattr(row, "has_samples", False):
+                result = score_samples(row.prompt, row.samples, entailment=backend)
+            elif sampler is not None:
+                result = score(row.prompt, sampler, n_samples=n_samples, entailment=backend)
+            else:
+                report.add(
+                    "task separation",
+                    FAIL,
+                    "dev set has prompts but no generations, and no sampler was given",
+                    "Either include a 'samples' field per row, or pass --sampler so "
+                    "the prompts can be sampled.",
+                )
+                return None
+        except Exception as exc:  # noqa: BLE001
+            report.add("task separation", FAIL, f"scoring failed: {type(exc).__name__}: {exc}")
+            return None
+        results.append(result)
+        labels.append(int(label))
+
+    if len(labels) < 2 or len(set(labels)) < 2:
+        report.add(
+            "task separation",
+            FAIL,
+            f"{len(labels)} usable labelled row(s), {len(set(labels))} distinct label(s)",
+            "Separation cannot be measured without both classes: prompts the model "
+            "answered correctly (label 0) AND prompts where it hallucinated (label 1).",
+        )
+        return None
+
+    try:
+        calibration = calibrate(results, labels, confidence=confidence)
+    except CalibrationError as exc:
+        report.add("task separation", FAIL, str(exc))
+        return None
+
+    detail = (
+        f"AUROC {calibration.auroc:.3f} "
+        f"[{calibration.auroc_lower:.3f}, {calibration.auroc_upper:.3f}] "
+        f"on {calibration.n_samples} labelled prompts"
+    )
+
+    if calibration.auroc < 0.5 and calibration.auroc_upper < 0.5:
+        report.add(
+            "task separation",
+            FAIL,
+            detail + " - ANTI-CORRELATED",
+            "Semantic entropy is pointing the wrong way: high entropy is predicting "
+            "CORRECT answers on this dev set. Check that label 1 means 'the model "
+            "hallucinated' and not the reverse, and that samples line up with prompts.",
+        )
+    elif not calibration.separates:
+        needed = _needed_for(calibration)
+        report.add(
+            "task separation",
+            FAIL,
+            detail,
+            f"The confidence interval includes 0.5, so this dev set does not "
+            f"establish that semantic entropy separates hallucinations on your task. "
+            f"{needed} Do not deploy on this evidence: an unvalidated gate that "
+            "defers traffic costs you money and buys nothing measurable.",
+        )
+    elif calibration.auroc < 0.65:
+        report.add(
+            "task separation",
+            WARN,
+            detail,
+            "Real but weak separation. Usable as a soft signal (warn / defer); do "
+            "not hard-block on it. Pair the gate with retrieval grounding.",
+        )
+    elif calibration.caveats:
+        report.add(
+            "task separation",
+            WARN,
+            detail,
+            "Separation established, but: " + " ".join(calibration.caveats),
+        )
+    else:
+        report.add(
+            "task separation",
+            PASS,
+            detail,
+            "" if calibration.auroc >= 0.8 else "Moderate but solid separation.",
+        )
+
+    report.add(
+        "suggested threshold",
+        PASS if calibration.trustworthy else WARN,
+        f"{calibration.threshold:.4f} ({calibration.criterion}, "
+        f"TPR {calibration.operating_point.tpr:.2f} / "
+        f"FPR {calibration.operating_point.fpr:.2f})",
+        ""
+        if calibration.trustworthy
+        else "Fitted on evidence that carries caveats - treat as provisional.",
+    )
+    return calibration
+
+
+def _needed_for(calibration: Any) -> str:
+    from .calibrate import required_dev_set_size
+
+    needed = required_dev_set_size(
+        calibration.auroc,
+        confidence=calibration.confidence,
+        positive_rate=calibration.base_rate or 0.5,
+    )
+    if needed is None:
+        return (
+            "At the observed effect size no realistic dev set would settle it, "
+            "which is itself the answer: the signal is not there for this task."
+        )
+    if needed <= calibration.n_samples:
+        return "Label more prompts, or check that your labels are correct."
+    return f"About {needed} labelled prompts would settle it at this effect size."
 
 
 # ------------------------------------------------------------------- checks

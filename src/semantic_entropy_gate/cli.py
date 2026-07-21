@@ -21,7 +21,7 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from . import __version__
 from .calibrate import calibrate
-from .dataset import DatasetRow, load_dataset
+from .dataset import DatasetRow, load_dataset, write_jsonl
 from .entailment import (
     SMALL_CROSS_ENCODER,
     CachedEntailment,
@@ -438,11 +438,106 @@ def cmd_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_label(args: argparse.Namespace) -> int:
+    """Interactively label scored prompts into the dev set `doctor` needs.
+
+    The workflow bottleneck is never the maths - it is that nobody has labelled
+    data lying around. This closes the loop: point it at a JSONL of prompts
+    (with generations, or with --sampler), it shows you each prompt with the
+    model's consensus answer and the disagreement evidence, you answer one
+    question - was the model right? - and it writes a dev set that `doctor
+    --dev-set` and `calibrate` consume directly.
+
+    Labels are judged against the CONSENSUS answer (the majority cluster), since
+    that is what a user of the gated system would have received.
+    """
+    rows = load_dataset(args.input, label_key=args.label_key)
+    entailment = _build_entailment(args)
+    out_rows: List[dict] = []
+    n_labelled = 0
+    skipped = 0
+
+    print(
+        f"Labelling {len(rows)} prompts -> {args.out}\n"
+        "For each prompt, judge the CONSENSUS answer: is it factually correct?\n"
+        "  y = correct (label 0)   n = wrong/hallucinated (label 1)\n"
+        "  s = skip   q = save and quit\n",
+        file=sys.stderr,
+    )
+
+    for index, row in enumerate(rows, start=1):
+        if row.label is not None and not args.relabel:
+            out_rows.append(row.to_dict())
+            n_labelled += 1
+            continue
+        if row.has_samples:
+            result = score_samples(
+                row.prompt, row.samples, entailment=entailment, strict=not args.relaxed
+            )
+        elif args.sampler:
+            result = score(
+                row.prompt,
+                _load_entrypoint(args.sampler),
+                n_samples=args.n_samples,
+                entailment=entailment,
+                strict=not args.relaxed,
+            )
+        else:
+            raise SemanticEntropyError(f"row {index} has no samples and no --sampler was given")
+
+        print("=" * 70)
+        print(f"[{index}/{len(rows)}] {result.prompt[:66]}")
+        print(
+            f"  entropy {result.normalized_entropy:.3f} | {result.n_clusters} meaning(s) | "
+            f"agreement {result.agreement:.0%}"
+            + (" | DECLINED TO ANSWER" if result.abstained else "")
+        )
+        print(f"  consensus: {result.consensus_answer!r}")
+        if result.n_clusters > 1:
+            for cid, _size, prob, rep in result.cluster_table()[:3]:
+                print(f"    cluster {cid} ({prob:.0%}): {rep[:60]!r}")
+
+        while True:
+            try:
+                answer = input("  correct? [y/n/s/q] ").strip().lower()
+            except EOFError:
+                answer = "q"
+            if answer in ("y", "n", "s", "q"):
+                break
+        if answer == "q":
+            skipped += len(rows) - index + 1
+            break
+        if answer == "s":
+            skipped += 1
+            continue
+        data = row.to_dict()
+        data["samples"] = [sample.text for sample in result.samples]
+        data[args.label_key] = 0 if answer == "y" else 1
+        out_rows.append(data)
+        n_labelled += 1
+
+    if out_rows:
+        write_jsonl(args.out, out_rows)
+    print(
+        f"\nwrote {n_labelled} labelled row(s) to {args.out} ({skipped} skipped). "
+        f"Next: sem-gate doctor --dev-set {args.out}",
+        file=sys.stderr,
+    )
+    if n_labelled < 30:
+        print(
+            f"note: {n_labelled} labels is below the ~30 minimum for a meaningful "
+            "AUROC interval; keep going when you can.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Check whether this deployment is actually fit to gate production traffic."""
     sampler = _load_entrypoint(args.sampler) if args.sampler else None
     judge = _load_entrypoint(args.judge) if args.judge else None
     entailment = _build_entailment(args) if args.entailment != "auto" else None
+    dev_rows = load_dataset(args.dev_set, label_key=args.label_key) if args.dev_set else None
     report = preflight(
         sampler=sampler,
         entailment=entailment,
@@ -452,6 +547,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         n_samples=args.n_samples,
         probe_prompt=args.prompt,
         require_production_backend=not args.allow_triage,
+        dev_set=dev_rows,
+        confidence=args.confidence,
     )
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
@@ -576,6 +673,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_scoring_args(p_gate)
     p_gate.set_defaults(func=cmd_gate)
 
+    p_label = sub.add_parser(
+        "label",
+        help="interactively label prompts into the dev set `doctor --dev-set` needs",
+    )
+    p_label.add_argument("--input", required=True, help="JSONL with prompts (and ideally samples)")
+    p_label.add_argument("--out", default="dev_set.jsonl")
+    p_label.add_argument("--label-key", default="label")
+    p_label.add_argument(
+        "--relabel", action="store_true", help="re-ask even for rows that already carry a label"
+    )
+    _add_scoring_args(p_label)
+    p_label.set_defaults(func=cmd_label)
+
     p_doctor = sub.add_parser(
         "doctor", help="check whether this setup is fit to gate production traffic"
     )
@@ -590,6 +700,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--prompt",
         default="In one sentence, what is the capital of France?",
         help="prompt used to probe the sampler",
+    )
+    p_doctor.add_argument(
+        "--dev-set",
+        help="labelled JSONL from YOUR task (build one with `sem-gate label`); unlocks "
+        "the task-separation check - the one no other check can substitute for",
+    )
+    p_doctor.add_argument("--label-key", default="label")
+    p_doctor.add_argument(
+        "--confidence",
+        type=float,
+        default=0.95,
+        choices=[0.80, 0.90, 0.95, 0.99],
+        help="confidence level for the AUROC interval",
     )
     p_doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     _add_scoring_args(p_doctor)

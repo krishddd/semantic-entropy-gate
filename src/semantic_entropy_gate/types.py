@@ -495,6 +495,8 @@ class CalibrationResult:
 
     threshold: float
     auroc: float
+    auroc_lower: float
+    auroc_upper: float
     auprc: float
     criterion: str
     n_samples: int
@@ -503,20 +505,37 @@ class CalibrationResult:
     operating_point: ThresholdPoint
     curve: List[ThresholdPoint] = field(default_factory=list)
     base_rate: float = 0.0
+    confidence: float = 0.95
     caveats: List[str] = field(default_factory=list)
     """Reasons this threshold is less trustworthy than its decimals suggest."""
+
+    @property
+    def separates(self) -> bool:
+        """Does this dev set *establish* a signal, not merely suggest one?
+
+        True only when the whole confidence interval sits above chance. A point
+        estimate of 0.8 with an interval of [0.45, 0.95] has not shown anything;
+        reporting it as if it had is the overconfidence this library detects,
+        turned on the library itself.
+        """
+        return self.auroc_lower > 0.5
 
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def trustworthy(self) -> bool:
         """No caveats and better-than-chance separation."""
-        return not self.caveats and self.auroc >= 0.65
+        return not self.caveats and self.auroc >= 0.65 and self.separates
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "threshold": self.threshold,
             "auroc": self.auroc,
+            "auroc_lower": self.auroc_lower,
+            "auroc_upper": self.auroc_upper,
+            "auroc_ci": [self.auroc_lower, self.auroc_upper],
+            "confidence": self.confidence,
+            "separates": self.separates,
             "auprc": self.auprc,
             "criterion": self.criterion,
             "n_samples": self.n_samples,
@@ -542,7 +561,14 @@ class CalibrationResult:
                 f"Dev set:      {self.n_samples} prompts "
                 f"({self.n_positive} hallucinated / {self.n_negative} correct, "
                 f"base rate {self.base_rate:.1%})",
-                f"AUROC:        {self.auroc:.4f}  ({quality} separation)",
+                f"AUROC:        {self.auroc:.4f}  "
+                f"[{self.auroc_lower:.3f}, {self.auroc_upper:.3f}] "
+                f"{int(self.confidence * 100)}% CI  ({quality} separation)",
+                (
+                    "              the interval clears chance: the signal is real"
+                    if self.separates
+                    else "              the interval INCLUDES 0.5: separation is NOT established"
+                ),
                 f"AUPRC:        {self.auprc:.4f}",
                 "-" * width,
                 f"Criterion:    {self.criterion}",

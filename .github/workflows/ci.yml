@@ -71,6 +71,11 @@ jobs:
           python examples/calibrate_threshold.py
           python examples/refusal_aware_gate.py
           python examples/production_agent.py
+      - name: doctor validates task separation on a labelled dev set
+        run: |
+          sem-gate doctor --entailment lexical --allow-triage --dev-set data/demo.jsonl | tee /tmp/doctor.out
+          grep -q "task separation" /tmp/doctor.out
+          grep -q "AUROC" /tmp/doctor.out
       - name: sem-gate doctor rejects a triage backend (exit code 1)
         run: |
           set +e

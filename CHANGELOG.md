@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-21
+
+Closes the gap named at the end of 0.4.0: *"`sem-gate doctor` still can't check
+the thing that matters most — whether semantic entropy separates hallucinations
+on your task."* Now it can, and the statistics it reports are held to the same
+standard the library holds models to.
+
+### Added
+
+- **`doctor --dev-set` / `preflight(dev_set=...)`** — the task-separation check.
+  Scores your labelled prompts (offline if rows carry generations, via your
+  sampler if not) and reports AUROC **with a Hanley–McNeil confidence interval**.
+  The verdict logic:
+  - interval clears 0.5 -> PASS (WARN below 0.65: real but weak, do not
+    hard-block), plus a **suggested threshold** fitted on the same data;
+  - interval includes 0.5 -> **FAIL**: this dev set has not established a
+    signal, however good the point estimate looks, and the remedy says how many
+    labels would settle it;
+  - AUROC credibly *below* 0.5 -> FAIL as **ANTI-CORRELATED**: your labels are
+    probably backwards, and fitting a threshold to them would be nonsense;
+  - no dev set -> **SKIP that names the gap**: "this is the biggest remaining
+    unknown", so a wall of PASSes can never imply a validation that never ran.
+- **`sem-gate label`** — the missing workflow step. Nobody has labelled data
+  lying around, so this builds it: for each prompt it shows the model's
+  consensus answer with the disagreement evidence, you answer one question
+  (was the model right?), and it writes the dev set `doctor` and `calibrate`
+  consume. Quitting saves progress; existing labels are kept.
+- **`auroc_ci()`** — Hanley–McNeil interval with a continuity correction at the
+  degenerate ends: perfect separation on 12 prompts reports [0.93, 1.00], not
+  [1.00, 1.00]. "Established with certainty, from 12 prompts" is the exact
+  overconfidence this library flags in models; its own maths does not get to
+  commit it.
+- **`required_dev_set_size()`** — the power estimate behind "how many more
+  labels do I need?": smallest dev set whose lower bound clears chance at the
+  observed effect size, or None when no realistic set would (which is itself
+  the answer: the signal is not there).
+- **`CalibrationResult.auroc_lower/upper`, `.separates`** — the interval travels
+  on every calibration, in `explain()` ("the interval clears chance" vs
+  "separation is NOT established"), the JSON report, and `.trustworthy` (which
+  now requires the interval to clear chance, not just a good point estimate).
+  v0.4.0 report artefacts still load (interval degrades to the point estimate).
+
+### Changed
+
+- `preflight()` returns its fitted `CalibrationResult` on `report.calibration`,
+  so `doctor` hands you the threshold to deploy in the same breath as the
+  verdict.
+- `examples/production_agent.py` passes its dev set to preflight — the flagship
+  example now demonstrates the full loop: label -> validate -> calibrate ->
+  gate.
+
 ## [0.4.0] - 2026-07-21
 
 Makes the library fit for the case that actually matters: someone dropping it
@@ -226,6 +277,7 @@ First public release. Implements semantic entropy for hallucination detection
 - Zero runtime dependencies; MIT licensed; CI across Python 3.9–3.12 with lint,
   tests, an offline CLI smoke test and a clean-env wheel install check.
 
+[0.5.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.5.0
 [0.4.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.4.0
 [0.3.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.3.0
 [0.2.0]: https://github.com/krishddd/semantic-entropy-gate/releases/tag/v0.2.0

@@ -119,6 +119,39 @@ NOT READY: 1 failure(s), 0 warning(s). Fix the failures before gating anything.
 
 It **calls your sampler** — that is the only way to catch a deterministic one, and a deterministic sampler is the single most common way this library gets deployed as a no-op. Exit code is non-zero when not ready, so it drops straight into CI. Available as `preflight()` from Python too.
 
+### Validate on *your* task, not on faith
+
+Everything above verifies the machinery. None of it can answer the question that actually matters: **does semantic entropy separate hallucinations on your task?** Only labelled data answers that — so `doctor` consumes it, and the workflow to get it is two commands:
+
+```bash
+# 1. Label prompts from your own domain. Each one shows the model's consensus
+#    answer and the disagreement evidence; you answer y/n: was the model right?
+sem-gate label --input prompts.jsonl --out dev_set.jsonl --sampler myproject.llm:sample
+
+# 2. Hand the labels to doctor.
+sem-gate doctor --dev-set dev_set.jsonl --sampler myproject.llm:sample
+```
+
+```
+[PASS] task separation        AUROC 0.847 [0.762, 0.932] on 120 labelled prompts
+[PASS] suggested threshold    0.6210 (youden, TPR 0.86 / FPR 0.12)
+```
+
+Three properties of that check are non-negotiable:
+
+- **The interval, not the point.** An AUROC of 0.85 from 12 prompts and from 300 prompts print identically; they are not the same claim. `doctor` reports a Hanley–McNeil confidence interval, and if it includes 0.5 the verdict is FAIL — this dev set has *not established* a signal, however good the number looks. A dev set with perfect separation gets a continuity correction rather than a degenerate `[1.000, 1.000]`: reporting certainty from 12 prompts is the exact overconfidence this library exists to flag.
+- **A failed check tells you the cost of fixing it.** `required_dev_set_size(auroc)` estimates how many labels would settle the question at the observed effect size — "about 124 more prompts", or "no realistic dev set would, the signal is not there", which is itself the answer.
+- **Backwards labels are caught.** If high entropy predicts *correct* answers on your dev set, the check fails as ANTI-CORRELATED and says to check which way your labels point, rather than fitting a nonsense threshold.
+
+Without `--dev-set`, the report says so instead of implying otherwise:
+
+```
+[SKIP] task separation        no labelled dev set supplied
+       -> THIS IS THE BIGGEST REMAINING UNKNOWN. Every other check above
+          verifies that the machinery runs; none of them can tell you whether
+          semantic entropy actually separates hallucinations on YOUR task.
+```
+
 ### Or just watch it work, offline
 
 ```bash

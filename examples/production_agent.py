@@ -20,6 +20,7 @@ import json
 import sys
 
 from semantic_entropy_gate import (
+    DatasetRow,
     Gate,
     LexicalEntailment,
     LLMJudgeEntailment,
@@ -27,6 +28,7 @@ from semantic_entropy_gate import (
     preflight,
     score_samples,
 )
+from semantic_entropy_gate.types import Sample
 
 # ===========================================================================
 # 1. YOUR MODEL. Replace these three.
@@ -92,6 +94,14 @@ def build_gate(threshold: float, *, calibrated: bool) -> Gate:
         calibrated=calibrated,
         n_samples=6,
         probe_prompt="What is the refund window for order 41?",
+        # The labelled dev set unlocks the check none of the others can
+        # substitute for: does semantic entropy separate hallucinations on THIS
+        # task? Without it, doctor reports the gap as the biggest remaining
+        # unknown rather than letting a wall of PASSes imply otherwise.
+        dev_set=[
+            DatasetRow(prompt=prompt, samples=[Sample(text=t) for t in samples], label=label)
+            for prompt, (samples, label) in _DEV_SET.items()
+        ],
     )
     print(report.render())
     print()
