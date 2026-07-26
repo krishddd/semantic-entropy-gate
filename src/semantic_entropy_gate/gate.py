@@ -24,6 +24,7 @@ from __future__ import annotations
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from .active_inference import Policy, default_policies, rank_policies
 from .entailment import EntailmentModel, auto_entailment
 from .errors import GateBlockedError
 from .refusal import RefusalDetector
@@ -117,6 +118,8 @@ class Gate:
         refusal_policy: str = "defer",
         refusal_detector: Optional[RefusalDetector] = None,
         require_production_backend: bool = False,
+        policies: Optional[Sequence[Policy]] = None,
+        route_policies: bool = False,
     ) -> None:
         config_warnings = validate_threshold(threshold, normalized=normalized)
         if warn_threshold is None:
@@ -183,6 +186,18 @@ class Gate:
         self.min_samples = min_samples
         self.refusal_policy = refusal_policy
         self.refusal_detector = refusal_detector
+        # DEFER means "acquire information before acting" — but *which* action
+        # reduces this uncertainty is a policy question, not a threshold question.
+        # When given a policy set (or route_policies=True for the default act/
+        # forage pair), the gate ranks them by expected free energy and stamps the
+        # winner onto every DEFER decision, so the on_defer handler can route to
+        # retrieval / clarification / escalation instead of one generic bucket.
+        if policies is not None:
+            self.policies: Optional[List[Policy]] = list(policies)
+        elif route_policies:
+            self.policies = default_policies()
+        else:
+            self.policies = None
 
         # The score is only as trustworthy as the oracle underneath it. Shipping
         # the stdlib heuristic in front of an irreversible action is a mistake
@@ -403,8 +418,27 @@ class Gate:
                 "unreliable": not result.reliable,
             },
         )
+        if action is GateAction.DEFER:
+            self._route_policies(decision)
         self._record(decision)
         return decision
+
+    def _route_policies(self, decision: GateDecision) -> None:
+        """Stamp the expected-free-energy-minimising next action onto a DEFER.
+
+        No-op unless the gate was configured with a policy set. Ranking is over
+        the *result*, so the recommendation reflects how much uncertainty is
+        actually left to resolve: foraging wins when ambiguity is high, and a
+        policy that gains nothing epistemically loses. The full ranking is kept on
+        the decision so the choice is auditable, not just asserted.
+        """
+        if not self.policies:
+            return
+        ranked = rank_policies(self.policies, decision.result, normalized=self.normalized)
+        if not ranked:
+            return
+        decision.recommended_policy = ranked[0].policy.name
+        decision.metadata["policy_ranking"] = [e.to_dict() for e in ranked]
 
     # --------------------------------------------------------------- gating
 

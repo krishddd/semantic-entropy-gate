@@ -271,6 +271,51 @@ def test_resolve_rejects_negative_retries():
         gate.resolve("q", lambda p, d: None, max_retries=-1)
 
 
+# ---------------------------------------------------- EFE policy routing (X-1)
+
+
+def test_defer_carries_no_policy_by_default(confabulating_samples):
+    # Opt-in only: unconfigured gates behave exactly as before.
+    gate = confident_gate(confabulating_samples, threshold=0.55)
+    decision = gate.check_samples("q", confabulating_samples)
+    assert decision.action is GateAction.DEFER
+    assert decision.recommended_policy is None
+    assert "policy_ranking" not in decision.metadata
+
+
+def test_defer_routes_to_the_foraging_policy(confabulating_samples):
+    gate = confident_gate(confabulating_samples, threshold=0.55, route_policies=True)
+    decision = gate.check_samples("q", confabulating_samples)
+    assert decision.action is GateAction.DEFER
+    # High ambiguity -> the free-energy-minimising move is to gather information,
+    # not to execute the irreversible action.
+    assert decision.recommended_policy == "gather_information"
+    ranking = decision.metadata["policy_ranking"]
+    assert ranking[0]["policy"] == "gather_information"
+    assert decision.to_dict()["recommended_policy"] == "gather_information"
+
+
+def test_custom_policies_are_ranked_by_expected_free_energy(confabulating_samples):
+    from semantic_entropy_gate.active_inference import Policy
+
+    policies = [
+        Policy("execute_refund", pragmatic_value=1.0, irreversible=True),
+        Policy("retrieve_docs", information_gain=0.9, epistemic=True),
+        Policy("ask_user", information_gain=0.7, epistemic=True),
+    ]
+    gate = confident_gate(confabulating_samples, threshold=0.55, policies=policies)
+    decision = gate.check_samples("q", confabulating_samples)
+    assert decision.recommended_policy in {"retrieve_docs", "ask_user"}
+    assert decision.recommended_policy != "execute_refund"
+
+
+def test_allow_decisions_are_not_policy_stamped(confident_samples):
+    gate = confident_gate(confident_samples, threshold=0.55, route_policies=True)
+    decision = gate.run("q", lambda: "done")
+    assert decision.action is GateAction.ALLOW
+    assert decision.recommended_policy is None
+
+
 def test_default_warn_threshold_sits_below_the_defer_threshold():
     gate = Gate(None, threshold=0.5, entailment=LexicalEntailment())
     assert gate.warn_threshold == pytest.approx(0.3)

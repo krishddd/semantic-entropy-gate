@@ -439,6 +439,15 @@ class GateDecision:
     executed: bool = False
     warning: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    recommended_policy: Optional[str] = None
+    """On a DEFER, the name of the expected-free-energy-minimising next action.
+
+    ``None`` unless the gate was given a policy set (see
+    :mod:`semantic_entropy_gate.active_inference`). A generic DEFER says "do not
+    act"; this says *which* information-seeking move — retrieve, clarify,
+    re-sample, escalate — the ambiguity actually calls for. The full ranking is on
+    ``metadata['policy_ranking']``.
+    """
 
     @property
     def allowed(self) -> bool:
@@ -461,6 +470,7 @@ class GateDecision:
             "executed": self.executed,
             "warning": self.warning,
             "answer": self.answer if _json_safe(self.answer) else repr(self.answer),
+            "recommended_policy": self.recommended_policy,
             "result": self.result.to_dict(),
             "metadata": dict(self.metadata),
         }
