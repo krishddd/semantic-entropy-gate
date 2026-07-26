@@ -118,6 +118,12 @@ class Estimator(str, Enum):
     DISCRETE = "discrete"
     """Empirical cluster frequencies only — needs no token log-probabilities."""
 
+    PROBE = "probe"
+    """A Semantic Entropy Probe *estimate* from a single hidden state, not a
+    measurement over N generations. Cheap screening; carries no samples or
+    clusters, and is only ever trusted when the probe is confident (see
+    :class:`~semantic_entropy_gate.gate.Gate`'s fast/slow cascade)."""
+
 
 @dataclass
 class EntropyResult:

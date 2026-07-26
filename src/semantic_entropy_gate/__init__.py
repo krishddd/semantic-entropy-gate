@@ -80,7 +80,7 @@ from .errors import (
     SamplingError,
     SemanticEntropyError,
 )
-from .gate import DEFAULT_THRESHOLD, REFUSAL_POLICIES, Gate, gate
+from .gate import DEFAULT_THRESHOLD, MODEL_ACCESS, REFUSAL_POLICIES, Gate, gate
 from .preflight import Check, PreflightReport, preflight
 from .probes import SemanticEntropyProbe, TokenPosition
 from .refusal import (
@@ -144,6 +144,7 @@ __all__ = [
     "gate",
     "DEFAULT_THRESHOLD",
     "REFUSAL_POLICIES",
+    "MODEL_ACCESS",
     # refusal / abstention detection
     "RefusalDetector",
     "PatternRefusalDetector",
