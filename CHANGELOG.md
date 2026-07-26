@@ -4,6 +4,62 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-07-26
+
+A 28-gap external review landed. Each "critical" claim was checked against the
+code before touching it, and several turned out already handled (the LLM-judge
+injection defence, the threshold-ordering raises) or premised on code that does
+not exist (the "unbounded DEFER loop" — the gate is single-shot). What follows
+is only what survived verification.
+
+### Added
+
+- **Expected Calibration Error (C-1).** AUROC asks whether a higher score *ranks*
+  a hallucination above a correct answer; a threshold gate reads the score *as a
+  probability*, which AUROC is silent on. `expected_calibration_error`,
+  `reliability_curve`, and `fit_platt` / `PlattScaler` measure and, if needed,
+  fix that. `CalibrationResult` gains `ece` / `reliability` / `calibrated`; a
+  high ECE adds a caveat and flips `trustworthy` to `False` (the fitted threshold
+  still holds — it is chosen on the ranking — but the raw score must not be read
+  as "X% likely wrong"). `sem-gate doctor` gains a first-class score-calibration
+  check. ECE is computed only on the normalised scale, skipped for raw nats.
+- **Bounded forage loop (G-1).** The reviewed "unbounded DEFER retry loop" does
+  not exist — `run()` calls `on_defer` once. The real gap is the loop a user
+  would hand-roll around it, so `Gate.resolve(prompt, forage, max_retries=3)`
+  ships that loop with a hard cap and a `max_retries_exceeded` stamp for
+  human escalation.
+- **EFE policy routing (X-1).** `Gate(policies=...)` / `Gate(route_policies=True)`
+  ranks candidate policies by expected free energy on a DEFER and stamps the
+  winner onto `GateDecision.recommended_policy`, connecting the previously
+  orphaned `active_inference` module to the gate. Opt-in; unconfigured gates are
+  unchanged.
+- **Probe fast/slow cascade + capability guard (X-2, D-3).** `Gate(probe=...,
+  model_access="local_same_model")` short-circuits the full N-sample pipeline
+  when the Semantic Entropy Probe is confident; only the ambiguous middle band
+  pays full price. A confident *high* reading always short-circuits, a confident
+  *low* reading only under `probe_fast_allow=True`. Wiring the probe without a
+  guard is the D-3 footgun, so every misconfiguration is a hard error at
+  construction: a probe is refused unless `model_access` is `local_same_model`,
+  a `model_family` mismatch raises, an unfitted probe raises, and a missing
+  family or validation AUROC warns audibly. `SemanticEntropyProbe` gains
+  `model_family` (persisted) and `is_fitted`; new `Estimator.PROBE`.
+
+### Changed
+
+- **Zero-width tier bands are announced (G-2).** Threshold ordering was already
+  enforced with hard raises; the residue was that `warn == threshold` (disables
+  WARN) and `block == threshold` (disables DEFER) passed silently. Both now emit
+  a `UserWarning` naming the collapsed tier — legal, but no longer unstated.
+
+### Notes
+
+- **LLM-judge prompt injection (P-1) was already mitigated** in the shipped
+  `LLMJudgeEntailment`: fenced and sanitised inputs, `looks_like_injection`
+  screening, last-line-only verdict parsing, and a NEUTRAL (uncertainty-raising)
+  fallback. No change; the review was stale on this point. The one residual idea
+  — a cross-backend consistency check — is left for a later release as it needs
+  two backends loaded at once.
+
 ## [0.7.0] - 2026-07-21
 
 The 0.6.0 note called two things irreducible: whether a label is true, and
