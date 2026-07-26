@@ -41,10 +41,15 @@ from .active_inference import (
     should_forage,
 )
 from .calibrate import (
+    ECE_DEPLOY_MAX,
+    PlattScaler,
     auprc,
     auroc,
     auroc_ci,
     calibrate,
+    expected_calibration_error,
+    fit_platt,
+    reliability_curve,
     required_dev_set_size,
     roc_curve,
     threshold_sweep,
@@ -109,6 +114,7 @@ from .types import (
     Estimator,
     GateAction,
     GateDecision,
+    ReliabilityBin,
     Sample,
     SemanticCluster,
     ThresholdPoint,
@@ -188,6 +194,11 @@ __all__ = [
     "auprc",
     "roc_curve",
     "threshold_sweep",
+    "reliability_curve",
+    "expected_calibration_error",
+    "PlattScaler",
+    "fit_platt",
+    "ECE_DEPLOY_MAX",
     # probes
     "SemanticEntropyProbe",
     "TokenPosition",
@@ -224,6 +235,7 @@ __all__ = [
     "GateDecision",
     "CalibrationResult",
     "ThresholdPoint",
+    "ReliabilityBin",
     # errors
     "SemanticEntropyError",
     "SamplingError",

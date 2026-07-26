@@ -24,7 +24,7 @@ import math
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .errors import CalibrationError
-from .types import CalibrationResult, EntropyResult, ThresholdPoint
+from .types import CalibrationResult, EntropyResult, ReliabilityBin, ThresholdPoint
 
 __all__ = [
     "calibrate",
@@ -34,8 +34,24 @@ __all__ = [
     "auprc",
     "roc_curve",
     "threshold_sweep",
+    "reliability_curve",
+    "expected_calibration_error",
+    "PlattScaler",
+    "fit_platt",
+    "ECE_DEPLOY_MAX",
     "CRITERIA",
 ]
+
+ECE_DEPLOY_MAX = 0.10
+"""Deployment budget for Expected Calibration Error.
+
+Above this, the entropy score does not behave as a probability: a fixed
+threshold on it does not mean what its decimals suggest, and either the threshold
+must be fitted directly (which :func:`calibrate` already does) or the score must
+be :class:`PlattScaler`-mapped before it is read as ``P(hallucination)``. The
+0.10 figure is the common reporting convention, not a law; tighten it for
+higher-stakes gates.
+"""
 
 Scored = Union[EntropyResult, float, int]
 
@@ -132,6 +148,13 @@ def calibrate(
     point = _select(curve, criterion, target_fpr=target_fpr, target_recall=target_recall)
     auc, lower, upper = auroc_ci(scores, ys, confidence=confidence)
 
+    # ECE only means anything when the score lives on the probability scale it is
+    # being read as. Raw-nats calibration is a valid ranking exercise but its
+    # scores are unbounded, so skip the probability metric rather than report a
+    # meaningless number.
+    reliability = reliability_curve(scores, ys) if normalized else []
+    ece = expected_calibration_error(scores, ys) if normalized else None
+
     # A threshold fitted to a handful of prompts is a number, not a measurement.
     # It will look authoritative in a report, so the report has to say otherwise.
     caveats: List[str] = []
@@ -164,6 +187,15 @@ def calibrate(
             f"the dev set contains only {len(set(scores))} distinct score(s), so the "
             "threshold sweep had almost nothing to choose between"
         )
+    if ece is not None and ece > ECE_DEPLOY_MAX:
+        caveats.append(
+            f"the score is not a calibrated probability (ECE {ece:.3f} > "
+            f"{ECE_DEPLOY_MAX:.2f}): AUROC {auc:.3f} says it *ranks* hallucinations "
+            "well, but a fixed threshold reads it as a probability and that reading "
+            "is off. The fitted threshold above still works (it is chosen on the "
+            "ranking); only stop interpreting the raw score as 'X% likely wrong'. "
+            "Use calibrate.fit_platt(...) if you need probabilities downstream."
+        )
 
     return CalibrationResult(
         threshold=point.threshold,
@@ -180,6 +212,8 @@ def calibrate(
         curve=curve,
         base_rate=n_pos / len(ys),
         dev_scores=list(scores),
+        ece=ece,
+        reliability=reliability,
         caveats=caveats,
         metadata={
             "normalized": normalized,
@@ -361,6 +395,140 @@ def auprc(scores: Sequence[float], labels: Sequence[int]) -> float:
         prev_recall = recall
         i = j + 1
     return total
+
+
+def reliability_curve(
+    scores: Sequence[float], labels: Sequence[int], *, n_bins: int = 10
+) -> List[ReliabilityBin]:
+    """Bin scores into ``n_bins`` equal-width buckets over ``[0, 1]``.
+
+    Each bucket reports how many predictions fell in it, the mean predicted value
+    (the score, read as ``P(hallucination)``), and the observed hallucination rate
+    (fraction of positives). A perfectly calibrated score has ``mean_predicted ==
+    fraction_positive`` in every non-empty bin. Empty bins are dropped rather than
+    reported as a spurious ``0 == 0`` agreement.
+
+    Scores are expected in ``[0, 1]`` (normalised entropy). Anything outside is
+    clamped into the end bins, because a probability estimate cannot live outside
+    the unit interval — and a raw-nats score does not belong here at all.
+    """
+    if n_bins < 1:
+        raise CalibrationError("n_bins must be >= 1")
+    if len(scores) != len(labels):
+        raise CalibrationError(f"scores/labels length mismatch: {len(scores)} vs {len(labels)}")
+    scores = _validate_scores(scores)
+    ys = [1 if bool(y) else 0 for y in labels]
+
+    counts = [0] * n_bins
+    sum_pred = [0.0] * n_bins
+    sum_pos = [0] * n_bins
+    for s, y in zip(scores, ys):
+        clamped = min(1.0, max(0.0, s))
+        # The top edge (1.0) belongs to the last bin, not a phantom (n_bins+1)th.
+        idx = min(n_bins - 1, int(clamped * n_bins))
+        counts[idx] += 1
+        sum_pred[idx] += clamped
+        sum_pos[idx] += y
+
+    bins: List[ReliabilityBin] = []
+    for i in range(n_bins):
+        if counts[i] == 0:
+            continue
+        bins.append(
+            ReliabilityBin(
+                lower=i / n_bins,
+                upper=(i + 1) / n_bins,
+                count=counts[i],
+                mean_predicted=sum_pred[i] / counts[i],
+                fraction_positive=sum_pos[i] / counts[i],
+            )
+        )
+    return bins
+
+
+def expected_calibration_error(
+    scores: Sequence[float], labels: Sequence[int], *, n_bins: int = 10
+) -> float:
+    """Count-weighted mean gap between predicted and observed hallucination rate.
+
+    ``ECE = sum_b (n_b / N) * |mean_predicted_b - fraction_positive_b|``.
+
+    This is the metric a *threshold* gate actually needs, and the one AUROC is
+    silent on: an AUROC of 0.87 whose scores all sit between 0.3 and 0.5 never
+    reaches a defer threshold of 0.7, so the gate is always ALLOW despite
+    "excellent" separation. ECE catches that; AUROC cannot.
+    """
+    bins = reliability_curve(scores, labels, n_bins=n_bins)
+    total = len(scores)
+    if total == 0:
+        raise CalibrationError("cannot compute ECE on an empty dev set")
+    return sum(b.count * b.gap for b in bins) / total
+
+
+class PlattScaler:
+    """A one-dimensional logistic map ``score -> P(hallucination)``.
+
+    When ECE is poor, the entropy score ranks well but is not itself a
+    probability. Platt scaling fits ``sigmoid(a * score + b)`` on the dev set so
+    the *output* can be read as a probability — turning a ranking signal into a
+    calibrated one without disturbing the ordering (``a`` is constrained positive
+    only implicitly by the fit; a genuinely anti-correlated score will produce a
+    negative ``a``, which :func:`calibrate` already flags upstream).
+
+    Pure-Python gradient descent, matching the dependency-free house style; a
+    two-parameter fit on a few hundred points converges in milliseconds.
+    """
+
+    def __init__(self, a: float = 1.0, b: float = 0.0) -> None:
+        self.a = a
+        self.b = b
+
+    def __call__(self, score: float) -> float:
+        return _sigmoid(self.a * float(score) + self.b)
+
+    def transform(self, scores: Sequence[float]) -> List[float]:
+        return [self(s) for s in scores]
+
+    def to_dict(self) -> Dict[str, float]:
+        return {"a": self.a, "b": self.b}
+
+
+def fit_platt(
+    scores: Sequence[float],
+    labels: Sequence[int],
+    *,
+    learning_rate: float = 0.5,
+    epochs: int = 500,
+) -> PlattScaler:
+    """Fit a :class:`PlattScaler` mapping raw scores to calibrated probabilities."""
+    xs = _validate_scores(scores)
+    ys = [1.0 if bool(y) else 0.0 for y in labels]
+    if len(xs) != len(ys):
+        raise CalibrationError(f"scores/labels length mismatch: {len(xs)} vs {len(ys)}")
+    if not xs:
+        raise CalibrationError("no data to fit Platt scaling")
+    if len(set(int(y) for y in ys)) < 2:
+        raise CalibrationError("Platt scaling needs both classes present")
+
+    a, b = 1.0, 0.0
+    n = len(xs)
+    for _ in range(epochs):
+        grad_a = grad_b = 0.0
+        for x, y in zip(xs, ys):
+            p = _sigmoid(a * x + b)
+            error = p - y
+            grad_a += error * x
+            grad_b += error
+        a -= learning_rate * grad_a / n
+        b -= learning_rate * grad_b / n
+    return PlattScaler(a, b)
+
+
+def _sigmoid(z: float) -> float:
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    exp_z = math.exp(z)
+    return exp_z / (1.0 + exp_z)
 
 
 def threshold_sweep(scores: Sequence[float], labels: Sequence[int]) -> List[ThresholdPoint]:

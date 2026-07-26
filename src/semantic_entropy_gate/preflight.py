@@ -310,6 +310,30 @@ def _check_task_separation(
             "" if calibration.auroc >= 0.8 else "Moderate but solid separation.",
         )
 
+    if calibration.ece is not None:
+        from .calibrate import ECE_DEPLOY_MAX
+
+        ece_detail = f"ECE {calibration.ece:.3f} (budget {ECE_DEPLOY_MAX:.2f})"
+        if calibration.calibrated:
+            report.add(
+                "score calibration",
+                PASS,
+                ece_detail,
+                "The score reads as a probability: '0.6' means roughly a 60% chance "
+                "the answer is wrong. AUROC alone would not have told you this.",
+            )
+        else:
+            report.add(
+                "score calibration",
+                WARN,
+                ece_detail + " - score is a RANKING, not a probability",
+                "Separation can still be real (see AUROC); the fitted threshold is "
+                "chosen on the ranking and remains valid. What is NOT valid is reading "
+                "the raw score as 'X% likely wrong', or hand-picking a threshold by "
+                "eyeballing the score scale. Pass scores through calibrate.fit_platt "
+                "if a downstream consumer needs true probabilities.",
+            )
+
     report.add(
         "suggested threshold",
         PASS if calibration.trustworthy else WARN,
