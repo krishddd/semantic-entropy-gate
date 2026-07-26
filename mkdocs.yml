@@ -1,0 +1,51 @@
+site_name: semantic-entropy-gate
+site_description: Detect LLM confabulation with semantic entropy and gate agent actions on it.
+site_url: https://krishddd.github.io/semantic-entropy-gate/
+repo_url: https://github.com/krishddd/semantic-entropy-gate
+repo_name: krishddd/semantic-entropy-gate
+edit_uri: edit/main/
+
+# The homepage is the repo README, copied to docs/index.md by the docs workflow
+# so there is a single source of truth. docs/ holds the deeper references.
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.top
+    - navigation.sections
+    - content.code.copy
+    - toc.integrate
+
+nav:
+  - Home: index.md
+  - Theory: theory.md
+  - Architecture: architecture.md
+  - Threat model: THREAT_MODEL.md
+  - Research notes: RESEARCH_NOTES.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - tables
+  - toc:
+      permalink: true
