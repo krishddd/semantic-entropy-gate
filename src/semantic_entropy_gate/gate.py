@@ -24,8 +24,10 @@ from __future__ import annotations
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from .active_inference import Policy, default_policies, rank_policies
 from .entailment import EntailmentModel, auto_entailment
 from .errors import GateBlockedError
+from .probes import SemanticEntropyProbe
 from .refusal import RefusalDetector
 from .safety import (
     DEFAULT_LIMITS,
@@ -37,7 +39,20 @@ from .sampling import Sampler
 from .score import DEFAULT_N_SAMPLES, score, score_samples
 from .types import EntropyResult, Estimator, GateAction, GateDecision
 
-__all__ = ["Gate", "gate", "DEFAULT_THRESHOLD", "REFUSAL_POLICIES"]
+__all__ = ["Gate", "gate", "DEFAULT_THRESHOLD", "REFUSAL_POLICIES", "MODEL_ACCESS"]
+
+MODEL_ACCESS = ("api_only", "local_same_model", "local_proxy_model")
+"""How much of the model under test the deployment can actually see.
+
+``api_only``          — a black-box API (GPT/Claude/Gemini). No hidden states, so
+                        no Semantic Entropy Probe; only the full N-sample path.
+``local_same_model``  — you host *the same model* you are gating, so its hidden
+                        states are the ones the probe was trained on. The only
+                        configuration in which a probe is valid.
+``local_proxy_model`` — you host a *different* model as a stand-in. Its activation
+                        geometry is not the probe's; a probe here scores confident
+                        nonsense, so the gate refuses it.
+"""
 
 REFUSAL_POLICIES = ("defer", "block", "allow")
 """What to do when every generation declined to answer.
@@ -117,6 +132,14 @@ class Gate:
         refusal_policy: str = "defer",
         refusal_detector: Optional[RefusalDetector] = None,
         require_production_backend: bool = False,
+        policies: Optional[Sequence[Policy]] = None,
+        route_policies: bool = False,
+        probe: Optional[SemanticEntropyProbe] = None,
+        model_access: str = "api_only",
+        model_family: Optional[str] = None,
+        probe_floor: float = 0.15,
+        probe_ceiling: float = 0.85,
+        probe_fast_allow: bool = False,
     ) -> None:
         config_warnings = validate_threshold(threshold, normalized=normalized)
         if warn_threshold is None:
@@ -125,14 +148,38 @@ class Gate:
             config_warnings += validate_threshold(
                 warn_threshold, normalized=normalized, name="warn_threshold"
             )
+        # Ordering is a hard invariant: warn above defer, or block below defer,
+        # is a misconfiguration that would issue inverted decisions for the gate's
+        # whole lifetime, so it raises rather than warns.
         if warn_threshold > threshold:
-            raise ValueError("warn_threshold must be <= threshold")
+            raise ValueError(
+                f"warn_threshold ({warn_threshold:.4f}) must be <= threshold "
+                f"({threshold:.4f}): a WARN band above the DEFER band is inverted."
+            )
         if block_threshold is not None:
             config_warnings += validate_threshold(
                 block_threshold, normalized=normalized, name="block_threshold"
             )
             if block_threshold < threshold:
-                raise ValueError("block_threshold must be >= threshold")
+                raise ValueError(
+                    f"block_threshold ({block_threshold:.4f}) must be >= threshold "
+                    f"({threshold:.4f}): a BLOCK band below the DEFER band is inverted."
+                )
+        # Equality is legal but collapses a tier: warn == threshold disables WARN
+        # (ALLOW runs up to the defer line); block == threshold disables DEFER
+        # (uncertain calls BLOCK outright). That can be deliberate, but a gate that
+        # advertises four tiers and silently issues three is exactly the kind of
+        # unstated claim this library refuses to make, so say it out loud.
+        if warn_threshold == threshold:
+            config_warnings.append(
+                f"warn_threshold equals threshold ({threshold:.4f}): the WARN tier is "
+                "zero-width and will never fire (calls go ALLOW -> DEFER directly)."
+            )
+        if block_threshold is not None and block_threshold == threshold:
+            config_warnings.append(
+                f"block_threshold equals threshold ({threshold:.4f}): the DEFER tier is "
+                "zero-width and will never fire (uncertain calls BLOCK outright)."
+            )
         for message in config_warnings:
             warnings.warn(message, UserWarning, stacklevel=2)
 
@@ -159,6 +206,18 @@ class Gate:
         self.min_samples = min_samples
         self.refusal_policy = refusal_policy
         self.refusal_detector = refusal_detector
+        # DEFER means "acquire information before acting" — but *which* action
+        # reduces this uncertainty is a policy question, not a threshold question.
+        # When given a policy set (or route_policies=True for the default act/
+        # forage pair), the gate ranks them by expected free energy and stamps the
+        # winner onto every DEFER decision, so the on_defer handler can route to
+        # retrieval / clarification / escalation instead of one generic bucket.
+        if policies is not None:
+            self.policies: Optional[List[Policy]] = list(policies)
+        elif route_policies:
+            self.policies = default_policies()
+        else:
+            self.policies = None
 
         # The score is only as trustworthy as the oracle underneath it. Shipping
         # the stdlib heuristic in front of an irreversible action is a mistake
@@ -179,17 +238,95 @@ class Gate:
                 _WARNED_BACKENDS.add(self.entailment.name)
                 warnings.warn(message, UserWarning, stacklevel=2)
         self.require_production_backend = require_production_backend
+
+        # --- Semantic Entropy Probe capability guard (D-3) ---------------------
+        # A probe predicts entropy from a single hidden state at ~1/10th the cost,
+        # but only for the model whose activation geometry it was trained on.
+        # Every way this can be misconfigured produces a *silently* invalid score,
+        # so each one is a hard error at construction, not a runtime surprise.
+        if model_access not in MODEL_ACCESS:
+            raise ValueError(f"model_access must be one of {MODEL_ACCESS}, got {model_access!r}")
+        self.model_access = model_access
+        self.model_family = model_family
+        self.probe = probe
+        self.probe_floor = probe_floor
+        self.probe_ceiling = probe_ceiling
+        self.probe_fast_allow = probe_fast_allow
+        if probe is not None:
+            if model_access != "local_same_model":
+                raise ValueError(
+                    "A Semantic Entropy Probe reads output_hidden_states, which exist "
+                    "only for a locally-hosted model. model_access="
+                    f"{model_access!r} cannot supply them: an api_only deployment has no "
+                    "hidden states, and a local_proxy_model's activations are a "
+                    "different geometry than the probe was trained on, so its scores "
+                    "would be confident nonsense. Set model_access='local_same_model' "
+                    "only if you host the same model you are gating; otherwise drop "
+                    "probe= and use the full N-sample path."
+                )
+            if not probe.is_fitted:
+                raise ValueError("probe is not fitted; call .fit(...) before gating on it")
+            if not (0.0 <= probe_floor < probe_ceiling <= 1.0):
+                raise ValueError(
+                    f"probe band invalid: need 0 <= probe_floor ({probe_floor}) < "
+                    f"probe_ceiling ({probe_ceiling}) <= 1"
+                )
+            if (
+                model_family is not None
+                and probe.model_family is not None
+                and probe.model_family != model_family
+            ):
+                raise ValueError(
+                    f"probe was trained on model_family {probe.model_family!r} but this "
+                    f"gate is for {model_family!r}: applying a probe to another model's "
+                    "activations produces invalid scores. Retrain the probe on this "
+                    "model, or gate the model it was trained on."
+                )
+            # These append AFTER the config_warnings emit-loop above, so they must
+            # warn themselves to reach the operator rather than sit silently on the
+            # gate. A probe pointed at the wrong (or an unvalidated) model is the
+            # exact silent-failure D-3 is about, so it must be audible.
+            if probe.model_family is None:
+                message = (
+                    "probe has no recorded model_family, so the gate cannot verify it "
+                    "matches the model being gated; a probe from the wrong model scores "
+                    "silently. Set probe.model_family (and the gate's model_family) to "
+                    "make the check enforceable."
+                )
+                config_warnings.append(message)
+                warnings.warn(message, UserWarning, stacklevel=2)
+            if probe.train_auroc is None:
+                message = (
+                    "probe reports no validation AUROC (train_auroc is None): it may be "
+                    "unvalidated. A probe fast-path is only as trustworthy as the probe."
+                )
+                config_warnings.append(message)
+                warnings.warn(message, UserWarning, stacklevel=2)
+
         self.config_warnings = config_warnings
         self.history: List[GateDecision] = []
 
     # -------------------------------------------------------------- measuring
 
-    def measure(self, prompt: str, **kwargs: Any) -> EntropyResult:
+    def measure(
+        self, prompt: str, *, hidden_state: Optional[Sequence[float]] = None, **kwargs: Any
+    ) -> EntropyResult:
         """Sample and score ``prompt`` without deciding anything.
+
+        If a ``hidden_state`` is supplied and this gate has a probe, the fast/slow
+        cascade runs first: when the probe is confident (below the floor or above
+        the ceiling) its cheap estimate is returned directly; only the ambiguous
+        middle band pays for the full N-sample measurement. Average latency
+        collapses toward one forward pass while the hard cases still get the real
+        pipeline.
 
         Propagates exceptions. Use :meth:`check` if you want the failure turned
         into a fail-closed decision instead of an exception.
         """
+        if hidden_state is not None and self.probe is not None:
+            screened = self._probe_screen(prompt, hidden_state)
+            if screened is not None:
+                return screened
         if self.sampler is None:
             raise ValueError("Gate has no sampler; use check_samples(prompt, samples) instead")
         return score(
@@ -202,6 +339,53 @@ class Gate:
             min_samples=kwargs.pop("min_samples", self.min_samples),
             refusal_detector=kwargs.pop("refusal_detector", self.refusal_detector),
             **kwargs,
+        )
+
+    def _probe_screen(self, prompt: str, hidden_state: Sequence[float]) -> Optional[EntropyResult]:
+        """Return a probe estimate when the probe is confident, else ``None``.
+
+        A high-confidence *high*-entropy reading always short-circuits (it can only
+        make the gate more cautious). A high-confidence *low*-entropy reading only
+        short-circuits when ``probe_fast_allow`` is set, because fast-allowing an
+        irreversible action on a single-pass estimate is a weaker measurement than
+        the N-sample one it replaces — opt-in, in keeping with "a measurement that
+        did not happen is not evidence of confidence".
+        """
+        p = self.probe.predict_proba(hidden_state)
+        if p >= self.probe_ceiling:
+            return self._probe_result(prompt, p, band="high")
+        if p <= self.probe_floor and self.probe_fast_allow:
+            return self._probe_result(prompt, p, band="low")
+        return None
+
+    def _probe_result(self, prompt: str, p: float, *, band: str) -> EntropyResult:
+        """Build the minimal EntropyResult carrying a probe estimate."""
+        note = (
+            f"Semantic Entropy Probe estimate (P(high entropy)={p:.3f}) from a single "
+            "hidden state, not an N-sample measurement; the probe was confident enough "
+            f"to short-circuit ({band} band). Trained on model_family="
+            f"{self.probe.model_family!r}."
+        )
+        return EntropyResult(
+            prompt=prompt,
+            samples=[],
+            clusters=[],
+            entropy=p,
+            normalized_entropy=p,
+            naive_entropy=0.0,
+            estimator=Estimator.PROBE,
+            entailment_backend=f"sep-probe(model_family={self.probe.model_family})",
+            metadata={
+                "probe": True,
+                "probe_proba": p,
+                "probe_band": band,
+                "probe_floor": self.probe_floor,
+                "probe_ceiling": self.probe_ceiling,
+                "model_family": self.probe.model_family,
+                "probe_train_auroc": self.probe.train_auroc,
+            },
+            warnings=[note],
+            reliable=True,
         )
 
     def check(self, prompt: str, **kwargs: Any) -> GateDecision:
@@ -379,8 +563,27 @@ class Gate:
                 "unreliable": not result.reliable,
             },
         )
+        if action is GateAction.DEFER:
+            self._route_policies(decision)
         self._record(decision)
         return decision
+
+    def _route_policies(self, decision: GateDecision) -> None:
+        """Stamp the expected-free-energy-minimising next action onto a DEFER.
+
+        No-op unless the gate was configured with a policy set. Ranking is over
+        the *result*, so the recommendation reflects how much uncertainty is
+        actually left to resolve: foraging wins when ambiguity is high, and a
+        policy that gains nothing epistemically loses. The full ranking is kept on
+        the decision so the choice is auditable, not just asserted.
+        """
+        if not self.policies:
+            return
+        ranked = rank_policies(self.policies, decision.result, normalized=self.normalized)
+        if not ranked:
+            return
+        decision.recommended_policy = ranked[0].policy.name
+        decision.metadata["policy_ranking"] = [e.to_dict() for e in ranked]
 
     # --------------------------------------------------------------- gating
 
@@ -391,6 +594,7 @@ class Gate:
         /,
         *args: Any,
         samples: Optional[Sequence[Any]] = None,
+        hidden_state: Optional[Sequence[float]] = None,
         **kwargs: Any,
     ) -> GateDecision:
         """Gate an action behind the uncertainty check.
@@ -411,7 +615,9 @@ class Gate:
         ...     print(decision.explain())
         """
         decision = (
-            self.check_samples(prompt, samples) if samples is not None else self.check(prompt)
+            self.check_samples(prompt, samples)
+            if samples is not None
+            else self.check(prompt, hidden_state=hidden_state)
         )
 
         if decision.action is GateAction.BLOCK:
@@ -430,6 +636,58 @@ class Gate:
         else:
             decision.answer = decision.result.consensus_answer
             decision.executed = True
+        return decision
+
+    def resolve(
+        self,
+        prompt: str,
+        forage: Callable[[str, GateDecision], Optional[str]],
+        *,
+        max_retries: int = 3,
+        **kwargs: Any,
+    ) -> GateDecision:
+        """Run a **bounded** information-seeking loop around a DEFER.
+
+        The gate itself is single-shot: :meth:`check` measures once and returns.
+        The natural next move on DEFER — acquire context, then measure again — is
+        a loop, and a loop with no cap is a production hazard: a structurally
+        ambiguous prompt ("what is the best programming language?") stays high-
+        entropy forever, a forager that doesn't actually reduce uncertainty spins,
+        and an oracle jittering near the threshold oscillates. Each turn costs N
+        generations and O(N^2) NLI calls, so an unbounded loop is unbounded spend.
+
+        ``resolve`` is that loop with the cap built in, so it cannot be forgotten.
+        ``forage(prompt, decision) -> Optional[str]`` acquires information and
+        returns a **revised prompt** (e.g. the question with retrieved context
+        appended) to try again, or ``None`` to stop foraging and accept the
+        current decision. After ``max_retries`` unsuccessful attempts the loop
+        exits with the last DEFER decision, stamped ``max_retries_exceeded`` so the
+        caller can escalate to a human rather than hang.
+
+        ALLOW / WARN / BLOCK all terminate immediately — foraging only makes sense
+        while the gate is asking for more information.
+        """
+        if max_retries < 0:
+            raise ValueError(f"max_retries must be >= 0, got {max_retries}")
+
+        decision = self.check(prompt, **kwargs)
+        attempts = 0
+        while decision.action is GateAction.DEFER and attempts < max_retries:
+            attempts += 1
+            revised = forage(prompt, decision)
+            if revised is None:
+                # The forager has nothing more to try; accept the current DEFER
+                # rather than loop on an unchanged prompt.
+                break
+            prompt = revised
+            decision = self.check(prompt, **kwargs)
+
+        decision.metadata["defer_attempts"] = attempts
+        if decision.action is GateAction.DEFER and attempts >= max_retries > 0:
+            decision.metadata["max_retries_exceeded"] = True
+            decision.reason += (
+                f" (still deferring after {attempts} forage attempt(s); escalate to a human)"
+            )
         return decision
 
     def wrap(self, fn: Callable[..., Any], *, prompt_arg: int = 0) -> Callable[..., GateDecision]:

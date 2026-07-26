@@ -102,6 +102,14 @@ class SemanticEntropyProbe:
     entropy_threshold: Optional[float] = None
     train_auroc: Optional[float] = None
     n_train: int = 0
+    model_family: Optional[str] = None
+    """Which model's hidden states this probe was trained on (e.g.
+    ``"meta-llama/Llama-3-8B"``). A probe learns the *representation geometry* of
+    one model; feeding it another model's activations produces confident nonsense.
+    Recorded here so a gate can refuse a mismatched probe with a hard error rather
+    than score silently against the wrong geometry. ``None`` = unrecorded, which a
+    gate treats as unverifiable rather than safe."""
+
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ train
@@ -172,15 +180,26 @@ class SemanticEntropyProbe:
         threshold: Optional[float] = None,
         position: str = TokenPosition.SLT,
         layer: int = -1,
+        model_family: Optional[str] = None,
         **kwargs: Any,
     ) -> "SemanticEntropyProbe":
-        """Convenience path: canonical scores in, trained probe out."""
+        """Convenience path: canonical scores in, trained probe out.
+
+        Pass ``model_family`` to stamp which model produced ``hidden_states`` — a
+        gate will later refuse to run this probe against a different model's
+        activations.
+        """
         labels, used = binarize_entropy(results, threshold=threshold)
-        probe = cls(position=position, layer=layer, **kwargs)
+        probe = cls(position=position, layer=layer, model_family=model_family, **kwargs)
         probe.entropy_threshold = used
         return probe.fit(hidden_states, labels)
 
     # -------------------------------------------------------------- inference
+
+    @property
+    def is_fitted(self) -> bool:
+        """Whether the probe has learned weights it can predict from."""
+        return bool(self.weights)
 
     def predict_proba(self, hidden_state: Sequence[float]) -> float:
         """``P(high semantic entropy)`` for a single hidden state."""
@@ -225,6 +244,7 @@ class SemanticEntropyProbe:
             "entropy_threshold": self.entropy_threshold,
             "train_auroc": self.train_auroc,
             "n_train": self.n_train,
+            "model_family": self.model_family,
             "metadata": dict(self.metadata),
         }
 
@@ -247,6 +267,7 @@ class SemanticEntropyProbe:
         probe.entropy_threshold = data.get("entropy_threshold")
         probe.train_auroc = data.get("train_auroc")
         probe.n_train = data.get("n_train", 0)
+        probe.model_family = data.get("model_family")
         probe.metadata = dict(data.get("metadata", {}))
         return probe
 

@@ -118,6 +118,12 @@ class Estimator(str, Enum):
     DISCRETE = "discrete"
     """Empirical cluster frequencies only — needs no token log-probabilities."""
 
+    PROBE = "probe"
+    """A Semantic Entropy Probe *estimate* from a single hidden state, not a
+    measurement over N generations. Cheap screening; carries no samples or
+    clusters, and is only ever trusted when the probe is confident (see
+    :class:`~semantic_entropy_gate.gate.Gate`'s fast/slow cascade)."""
+
 
 @dataclass
 class EntropyResult:
@@ -439,6 +445,15 @@ class GateDecision:
     executed: bool = False
     warning: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    recommended_policy: Optional[str] = None
+    """On a DEFER, the name of the expected-free-energy-minimising next action.
+
+    ``None`` unless the gate was given a policy set (see
+    :mod:`semantic_entropy_gate.active_inference`). A generic DEFER says "do not
+    act"; this says *which* information-seeking move — retrieve, clarify,
+    re-sample, escalate — the ambiguity actually calls for. The full ranking is on
+    ``metadata['policy_ranking']``.
+    """
 
     @property
     def allowed(self) -> bool:
@@ -461,6 +476,7 @@ class GateDecision:
             "executed": self.executed,
             "warning": self.warning,
             "answer": self.answer if _json_safe(self.answer) else repr(self.answer),
+            "recommended_policy": self.recommended_policy,
             "result": self.result.to_dict(),
             "metadata": dict(self.metadata),
         }
@@ -481,6 +497,31 @@ class ThresholdPoint:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class ReliabilityBin:
+    """One bin of a reliability diagram: predicted vs. observed hallucination rate.
+
+    A threshold gate reads the entropy score *as if* it were a probability — "0.6
+    means roughly a 60% chance this answer is wrong". ``mean_predicted`` is what
+    the score claimed on average inside this bin; ``fraction_positive`` is what
+    actually happened. Their gap is the miscalibration ECE sums up.
+    """
+
+    lower: float
+    upper: float
+    count: int
+    mean_predicted: float
+    fraction_positive: float
+
+    @property
+    def gap(self) -> float:
+        """``|predicted - observed|`` for this bin — the local calibration error."""
+        return abs(self.mean_predicted - self.fraction_positive)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {**asdict(self), "gap": self.gap}
 
 
 @dataclass
@@ -515,6 +556,35 @@ class CalibrationResult:
     caveats: List[str] = field(default_factory=list)
     """Reasons this threshold is less trustworthy than its decimals suggest."""
 
+    ece: Optional[float] = None
+    """Expected Calibration Error of the raw entropy score read as a probability.
+
+    AUROC asks "does a higher score rank hallucinations above correct answers?" —
+    a *ranking* question. ECE asks the *threshold* question: "when the score says
+    0.6, is the answer wrong ~60% of the time?" A gate compares the score to a
+    fixed number, so it implicitly trusts the score as a probability; ECE measures
+    how far that trust is misplaced. ``None`` when calibration ran without labels
+    binned finely enough to estimate it. See :data:`ECE_DEPLOY_MAX`.
+    """
+
+    reliability: List["ReliabilityBin"] = field(default_factory=list)
+    """The per-bin reliability diagram behind :attr:`ece`, for plotting/inspection."""
+
+    @property
+    def calibrated(self) -> Optional[bool]:
+        """Whether the score is usable as a probability (ECE within budget).
+
+        ``None`` when ECE was not estimated. A gate can separate well (high AUROC)
+        yet be badly calibrated (high ECE): the scores rank correctly but cluster
+        in a band the threshold never reaches. Both must hold before a fixed
+        threshold behaves as intended.
+        """
+        if self.ece is None:
+            return None
+        from .calibrate import ECE_DEPLOY_MAX
+
+        return self.ece <= ECE_DEPLOY_MAX
+
     @property
     def separates(self) -> bool:
         """Does this dev set *establish* a signal, not merely suggest one?
@@ -530,8 +600,13 @@ class CalibrationResult:
 
     @property
     def trustworthy(self) -> bool:
-        """No caveats and better-than-chance separation."""
-        return not self.caveats and self.auroc >= 0.65 and self.separates
+        """No caveats, better-than-chance separation, and calibrated if measured."""
+        return (
+            not self.caveats
+            and self.auroc >= 0.65
+            and self.separates
+            and self.calibrated is not False
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -548,6 +623,9 @@ class CalibrationResult:
             "n_positive": self.n_positive,
             "n_negative": self.n_negative,
             "base_rate": self.base_rate,
+            "ece": self.ece,
+            "calibrated": self.calibrated,
+            "reliability": [b.to_dict() for b in self.reliability],
             "caveats": list(self.caveats),
             "dev_scores": [round(v, 6) for v in self.dev_scores],
             "trustworthy": self.trustworthy,
@@ -577,6 +655,16 @@ class CalibrationResult:
                     else "              the interval INCLUDES 0.5: separation is NOT established"
                 ),
                 f"AUPRC:        {self.auprc:.4f}",
+                (
+                    f"ECE:          {self.ece:.4f}  "
+                    + (
+                        "(score reads as a probability)"
+                        if self.calibrated
+                        else "(score is a RANKING, not a probability at this threshold)"
+                    )
+                    if self.ece is not None
+                    else "ECE:          n/a"
+                ),
                 "-" * width,
                 f"Criterion:    {self.criterion}",
                 f"Threshold:    {self.threshold:.4f}  (normalized semantic entropy)",
