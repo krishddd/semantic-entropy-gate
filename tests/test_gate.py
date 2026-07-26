@@ -170,6 +170,107 @@ def test_thresholds_are_validated():
         Gate(None, threshold=0.5, block_threshold=0.1, entailment=LexicalEntailment())
 
 
+def test_zero_width_warn_band_is_flagged_not_silent():
+    with pytest.warns(UserWarning, match="WARN tier is zero-width"):
+        gate = Gate(None, threshold=0.5, warn_threshold=0.5, entailment=LexicalEntailment())
+    # The config is legal (WARN deliberately disabled), just announced.
+    assert any("zero-width" in w for w in gate.config_warnings)
+
+
+def test_zero_width_defer_band_is_flagged_not_silent():
+    with pytest.warns(UserWarning, match="DEFER tier is zero-width"):
+        Gate(None, threshold=0.5, block_threshold=0.5, entailment=LexicalEntailment())
+
+
+# --------------------------------------------------------------- bounded resolve
+
+
+def _conditioned_gate():
+    """A gate whose entropy drops only once the prompt carries 'RESOLVED'."""
+    from semantic_entropy_gate.types import Sample
+
+    # Semantically one answer but textually distinct, so the measurement is
+    # reliable (not the byte-identical case the failsafe flags) yet low-entropy.
+    _agree = [
+        "the answer is 42",
+        "the answer is 42.",
+        "answer is 42",
+        "yes the answer is 42",
+        "the answer is 42!",
+        "the answer is 42 indeed",
+    ]
+
+    def sampler(prompt, n):
+        if "RESOLVED" in prompt:
+            return [Sample(_agree[i % len(_agree)]) for i in range(n)]
+        return [Sample(f"the answer is {i}") for i in range(n)]  # all disagree
+
+    return Gate(sampler, threshold=0.5, n_samples=6, entailment=LexicalEntailment())
+
+
+def test_resolve_stops_when_foraging_resolves_the_uncertainty():
+    gate = _conditioned_gate()
+    calls = []
+
+    def forage(prompt, decision):
+        calls.append(prompt)
+        return prompt + " RESOLVED"
+
+    decision = gate.resolve("q", forage)
+    assert decision.action is GateAction.ALLOW
+    assert len(calls) == 1  # one forage, then it cleared
+    assert decision.metadata["defer_attempts"] == 1
+    assert "max_retries_exceeded" not in decision.metadata
+
+
+def test_resolve_terminates_at_the_cap_when_foraging_never_helps():
+    gate = _conditioned_gate()
+    attempts = []
+
+    def forage(prompt, decision):
+        attempts.append(prompt)
+        return prompt + " still-vague"  # never introduces RESOLVED
+
+    decision = gate.resolve("q", forage, max_retries=3)
+    assert decision.action is GateAction.DEFER
+    assert len(attempts) == 3  # hard cap, not infinite
+    assert decision.metadata["defer_attempts"] == 3
+    assert decision.metadata["max_retries_exceeded"] is True
+    assert "escalate to a human" in decision.reason
+
+
+def test_resolve_stops_early_when_forager_gives_up():
+    gate = _conditioned_gate()
+
+    def forage(prompt, decision):
+        return None  # nothing more to try
+
+    decision = gate.resolve("q", forage, max_retries=5)
+    assert decision.action is GateAction.DEFER
+    assert decision.metadata["defer_attempts"] == 1
+    assert "max_retries_exceeded" not in decision.metadata
+
+
+def test_resolve_with_zero_retries_is_single_shot():
+    gate = _conditioned_gate()
+    called = []
+
+    def forage(prompt, decision):
+        called.append(prompt)
+        return prompt + " RESOLVED"
+
+    decision = gate.resolve("q", forage, max_retries=0)
+    assert decision.action is GateAction.DEFER
+    assert called == []  # never foraged
+    assert "max_retries_exceeded" not in decision.metadata
+
+
+def test_resolve_rejects_negative_retries():
+    gate = _conditioned_gate()
+    with pytest.raises(ValueError, match="max_retries"):
+        gate.resolve("q", lambda p, d: None, max_retries=-1)
+
+
 def test_default_warn_threshold_sits_below_the_defer_threshold():
     gate = Gate(None, threshold=0.5, entailment=LexicalEntailment())
     assert gate.warn_threshold == pytest.approx(0.3)

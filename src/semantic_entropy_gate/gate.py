@@ -125,14 +125,38 @@ class Gate:
             config_warnings += validate_threshold(
                 warn_threshold, normalized=normalized, name="warn_threshold"
             )
+        # Ordering is a hard invariant: warn above defer, or block below defer,
+        # is a misconfiguration that would issue inverted decisions for the gate's
+        # whole lifetime, so it raises rather than warns.
         if warn_threshold > threshold:
-            raise ValueError("warn_threshold must be <= threshold")
+            raise ValueError(
+                f"warn_threshold ({warn_threshold:.4f}) must be <= threshold "
+                f"({threshold:.4f}): a WARN band above the DEFER band is inverted."
+            )
         if block_threshold is not None:
             config_warnings += validate_threshold(
                 block_threshold, normalized=normalized, name="block_threshold"
             )
             if block_threshold < threshold:
-                raise ValueError("block_threshold must be >= threshold")
+                raise ValueError(
+                    f"block_threshold ({block_threshold:.4f}) must be >= threshold "
+                    f"({threshold:.4f}): a BLOCK band below the DEFER band is inverted."
+                )
+        # Equality is legal but collapses a tier: warn == threshold disables WARN
+        # (ALLOW runs up to the defer line); block == threshold disables DEFER
+        # (uncertain calls BLOCK outright). That can be deliberate, but a gate that
+        # advertises four tiers and silently issues three is exactly the kind of
+        # unstated claim this library refuses to make, so say it out loud.
+        if warn_threshold == threshold:
+            config_warnings.append(
+                f"warn_threshold equals threshold ({threshold:.4f}): the WARN tier is "
+                "zero-width and will never fire (calls go ALLOW -> DEFER directly)."
+            )
+        if block_threshold is not None and block_threshold == threshold:
+            config_warnings.append(
+                f"block_threshold equals threshold ({threshold:.4f}): the DEFER tier is "
+                "zero-width and will never fire (uncertain calls BLOCK outright)."
+            )
         for message in config_warnings:
             warnings.warn(message, UserWarning, stacklevel=2)
 
@@ -430,6 +454,58 @@ class Gate:
         else:
             decision.answer = decision.result.consensus_answer
             decision.executed = True
+        return decision
+
+    def resolve(
+        self,
+        prompt: str,
+        forage: Callable[[str, GateDecision], Optional[str]],
+        *,
+        max_retries: int = 3,
+        **kwargs: Any,
+    ) -> GateDecision:
+        """Run a **bounded** information-seeking loop around a DEFER.
+
+        The gate itself is single-shot: :meth:`check` measures once and returns.
+        The natural next move on DEFER — acquire context, then measure again — is
+        a loop, and a loop with no cap is a production hazard: a structurally
+        ambiguous prompt ("what is the best programming language?") stays high-
+        entropy forever, a forager that doesn't actually reduce uncertainty spins,
+        and an oracle jittering near the threshold oscillates. Each turn costs N
+        generations and O(N^2) NLI calls, so an unbounded loop is unbounded spend.
+
+        ``resolve`` is that loop with the cap built in, so it cannot be forgotten.
+        ``forage(prompt, decision) -> Optional[str]`` acquires information and
+        returns a **revised prompt** (e.g. the question with retrieved context
+        appended) to try again, or ``None`` to stop foraging and accept the
+        current decision. After ``max_retries`` unsuccessful attempts the loop
+        exits with the last DEFER decision, stamped ``max_retries_exceeded`` so the
+        caller can escalate to a human rather than hang.
+
+        ALLOW / WARN / BLOCK all terminate immediately — foraging only makes sense
+        while the gate is asking for more information.
+        """
+        if max_retries < 0:
+            raise ValueError(f"max_retries must be >= 0, got {max_retries}")
+
+        decision = self.check(prompt, **kwargs)
+        attempts = 0
+        while decision.action is GateAction.DEFER and attempts < max_retries:
+            attempts += 1
+            revised = forage(prompt, decision)
+            if revised is None:
+                # The forager has nothing more to try; accept the current DEFER
+                # rather than loop on an unchanged prompt.
+                break
+            prompt = revised
+            decision = self.check(prompt, **kwargs)
+
+        decision.metadata["defer_attempts"] = attempts
+        if decision.action is GateAction.DEFER and attempts >= max_retries > 0:
+            decision.metadata["max_retries_exceeded"] = True
+            decision.reason += (
+                f" (still deferring after {attempts} forage attempt(s); escalate to a human)"
+            )
         return decision
 
     def wrap(self, fn: Callable[..., Any], *, prompt_arg: int = 0) -> Callable[..., GateDecision]:
